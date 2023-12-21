@@ -68,6 +68,7 @@ func initCLIDefaults() {
 	setCertContextDefaults()
 	setDebugRecoverContextDefaults()
 	setDebugSendKVBatchContextDefaults()
+	setRecoverfromcdcContextDefaults()
 
 	initPreFlagsDefaults()
 
@@ -724,4 +725,37 @@ func setUserfileContextDefaults() {
 // parsing, you probably should not be using this.
 func GetServerCfgStores() base.StoreSpecList {
 	return serverCfg.Stores
+}
+
+// restorefromcdcCtx captures the command-line parameters of the `recoverfromcdc` command.
+// See below for defaults.
+var recoverfromcdcCtx struct {
+	RecoverCockroachDBName        string
+	RecoverCockroachTableName     string
+	RecoverKafkaBootstrapServer   string
+	RecoverKafkaTopicName         string
+	RecoverKafkaTopicPartition    string // default is empty, if specified, convert to int.
+	RecoverStartTimestamp         string // format YYYY-MM-DD HH24:MI:SS.xxxxx
+	RecoverStartKafkaOffset       int    // default is 0
+	RecoverKafkaCommandConfigFile string
+	CliCtx                        *clicfg.Context
+	ConnCtx                       *clisqlclient.Context
+	ExecCtx                       *clisqlexec.Context
+}
+
+// setRecoverfromcdcContextDefaults set the default values in recoverfromcdcCtx.  This
+// function is called by initCLIDefaults() and thus re-called in every
+// test that exercises command-line parsing.
+func setRecoverfromcdcContextDefaults() {
+	recoverfromcdcCtx.CliCtx = &cliCtx.Context
+	recoverfromcdcCtx.ConnCtx = &clisqlclient.Context{}
+	recoverfromcdcCtx.ExecCtx = &clisqlexec.Context{}
+	recoverfromcdcCtx.RecoverCockroachDBName = "defaultdb"
+	recoverfromcdcCtx.RecoverCockroachTableName = ""
+	recoverfromcdcCtx.RecoverKafkaBootstrapServer = ""
+	recoverfromcdcCtx.RecoverKafkaTopicName = ""
+	recoverfromcdcCtx.RecoverKafkaTopicPartition = ""
+	recoverfromcdcCtx.RecoverStartTimestamp = "1970-01-01 00:00:00"
+	recoverfromcdcCtx.RecoverStartKafkaOffset = 0
+	recoverfromcdcCtx.RecoverKafkaCommandConfigFile = ""
 }

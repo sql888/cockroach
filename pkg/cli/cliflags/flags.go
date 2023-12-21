@@ -993,7 +993,7 @@ memory that the store may consume, for example:
 <PRE>
 
   --store=type=mem,size=20GiB
-  --store=type=mem,size=90%
+  --store
 
 </PRE>
 Optionally, to configure admission control enforcement to prevent disk
@@ -1954,5 +1954,63 @@ from node to node and previous application or staging attempt failed.
 		Description: `
 Maximum number of characters in printed keys and spans. If key representation
 exceeds this value, it is truncated. Set to 0 to disable truncation.`,
+	}
+
+	RecoverCockroachDBName = FlagInfo{
+		Name: "recover-db-name",
+		Description: `
+The cockroach database name to recover.`,
+	}
+
+	RecoverCockroachTableName = FlagInfo{
+		Name: "recover-table-name",
+		Description: `
+The cockroach table name to recover.`,
+	}
+
+	RecoverKafkaBootstrapServer = FlagInfo{
+		Name: "recover-kafka-bootstrap-server",
+		Description: `
+The Kafka bootstrap server URL. <dns_host_ip>:<port>`,
+	}
+
+	RecoverKafkaCommandConfigFile = FlagInfo{
+		Name: "recover-kafka-command-config",
+		Description: `
+The optional kafka config file which can provide authentication, consumer configs, etc.`,
+	}
+
+	RecoverKafkaTopicName = FlagInfo{
+		Name: "recover-kafka-topic-name",
+		Description: `
+The cockroach table name to recover.`,
+	}
+
+	RecoverKafkaTopicPartition = FlagInfo{
+		Name: "recover-kafka-topic-partition",
+		Description: `
+The partition number of the kafka topic to recover. It's rare to pin the recovery 
+to a single kafka partition, unless parallel recover processes are started. 
+
+When this is left empty, the recovery will check how many partitions the topic has,
+and spawn the corresponding number of kafka consumers (go routines) to consume each 
+partition and write to the cockroach db.`,
+	}
+
+	RecoverStartTimestamp = FlagInfo{
+		Name: "recover-start-timestamp",
+		Description: `
+The timestamp the recover will start from the kafka topic.  this needs the cockroach
+changefeed option 'update' to set, so it can scan the topic with the mvcc timestamp.
+
+The format will be YYYY-MM-DD HH24:MI:SS.nnnnnnn, and internally convert to the epoch
+nano seconds to compare with the mvcc timestamp in the CDC kafka message.`,
+	}
+
+	RecoverStartKafkaOffset = FlagInfo{
+		Name: "recover-kafka-start-offset",
+		Description: `
+The kafka offset the recover to start from.  This could be different for different 
+kafka partitions. `,
 	}
 )

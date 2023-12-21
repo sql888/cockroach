@@ -634,6 +634,7 @@ func init() {
 		genHAProxyCmd,
 		initCmd,
 		sqlShellCmd,
+		recoverfromcdcCmd,
 		/* StartCmds are covered above */
 	}
 	clientCmds = append(clientCmds, authCmds...)
@@ -748,6 +749,7 @@ func init() {
 		statementBundleRecreateCmd,
 		lsNodesCmd,
 		statusNodeCmd,
+		recoverfromcdcCmd,
 	}
 	sqlCmds = append(sqlCmds, authCmds...)
 	sqlCmds = append(sqlCmds, demoCmd.Commands()...)
@@ -954,6 +956,19 @@ func init() {
 	// userfile upload command.
 	{
 		cliflagcfg.BoolFlag(userFileUploadCmd.Flags(), &userfileCtx.recursive, cliflags.Recursive)
+	}
+
+	// recoverfromcdc command.
+	{
+		f := recoverfromcdcCmd.Flags()
+		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverCockroachDBName, cliflags.RecoverCockroachDBName)
+		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverCockroachTableName, cliflags.RecoverCockroachTableName)
+		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverKafkaBootstrapServer, cliflags.RecoverKafkaBootstrapServer)
+		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverKafkaTopicName, cliflags.RecoverKafkaTopicName)
+		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverKafkaTopicPartition, cliflags.RecoverKafkaTopicPartition)
+		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverStartTimestamp, cliflags.RecoverStartTimestamp)
+		cliflagcfg.IntFlag(f, &recoverfromcdcCtx.RecoverStartKafkaOffset, cliflags.RecoverStartKafkaOffset)
+		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverKafkaCommandConfigFile, cliflags.RecoverKafkaCommandConfigFile)
 	}
 }
 

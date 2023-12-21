@@ -267,6 +267,7 @@ func init() {
 		DebugCmd,
 		sqlfmtCmd,
 		workloadCmd,
+		recoverfromcdcCmd,
 	)
 }
 
