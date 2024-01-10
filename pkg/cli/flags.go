@@ -965,10 +965,15 @@ func init() {
 		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverCockroachTableName, cliflags.RecoverCockroachTableName)
 		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverKafkaBootstrapServer, cliflags.RecoverKafkaBootstrapServer)
 		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverKafkaTopicName, cliflags.RecoverKafkaTopicName)
-		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverKafkaTopicPartition, cliflags.RecoverKafkaTopicPartition)
+		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverKafkaTopicPartitions, cliflags.RecoverKafkaTopicPartitions)
 		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverStartTimestamp, cliflags.RecoverStartTimestamp)
-		cliflagcfg.IntFlag(f, &recoverfromcdcCtx.RecoverStartKafkaOffset, cliflags.RecoverStartKafkaOffset)
+		cliflagcfg.Int64Flag(f, &recoverfromcdcCtx.RecoverKafkaStartOffset, cliflags.RecoverKafkaStartOffset)
+		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverEndTimestamp, cliflags.RecoverEndTimestamp)
+		cliflagcfg.Int64Flag(f, &recoverfromcdcCtx.RecoverKafkaEndOffset, cliflags.RecoverKafkaEndOffset)
 		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverKafkaCommandConfigFile, cliflags.RecoverKafkaCommandConfigFile)
+		cliflagcfg.IntFlag(f, &recoverfromcdcCtx.RecoverBatchSize, cliflags.RecoverBatchSize)
+		cliflagcfg.BoolFlag(f, &recoverfromcdcCtx.RecoverUseBalanceDBConnection, cliflags.RecoverUseBalanceDBConnection)
+		cliflagcfg.StringFlag(f, &recoverfromcdcCtx.RecoverUseBalanceDBConnectionLocalityFilter, cliflags.RecoverUseBalanceDBConnectionLocalityFilter)
 	}
 }
 

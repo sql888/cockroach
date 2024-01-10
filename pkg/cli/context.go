@@ -68,7 +68,7 @@ func initCLIDefaults() {
 	setCertContextDefaults()
 	setDebugRecoverContextDefaults()
 	setDebugSendKVBatchContextDefaults()
-	setRecoverfromcdcContextDefaults()
+	setRecoverFromCDCContextDefaults()
 
 	initPreFlagsDefaults()
 
@@ -730,32 +730,42 @@ func GetServerCfgStores() base.StoreSpecList {
 // restorefromcdcCtx captures the command-line parameters of the `recoverfromcdc` command.
 // See below for defaults.
 var recoverfromcdcCtx struct {
-	RecoverCockroachDBName        string
-	RecoverCockroachTableName     string
-	RecoverKafkaBootstrapServer   string
-	RecoverKafkaTopicName         string
-	RecoverKafkaTopicPartition    string // default is empty, if specified, convert to int.
-	RecoverStartTimestamp         string // format YYYY-MM-DD HH24:MI:SS.xxxxx
-	RecoverStartKafkaOffset       int    // default is 0
-	RecoverKafkaCommandConfigFile string
-	CliCtx                        *clicfg.Context
-	ConnCtx                       *clisqlclient.Context
-	ExecCtx                       *clisqlexec.Context
+	RecoverCockroachDBName                      string
+	RecoverCockroachTableName                   string
+	RecoverKafkaBootstrapServer                 string
+	RecoverKafkaTopicName                       string
+	RecoverKafkaTopicPartitions                 string // default is empty, if specified, it's a list of partitions (int) separated by comma
+	RecoverStartTimestamp                       string // format YYYY-MM-DDTHH24:MI:SS.999999999Z UTC time
+	RecoverKafkaStartOffset                     int64  // default is 0
+	RecoverEndTimestamp                         string // format YYYY-MM-DDTHH24:MI:SS.999999999Z UTC time, default is empty
+	RecoverKafkaEndOffset                       int64  // default is 0
+	RecoverKafkaCommandConfigFile               string
+	RecoverBatchSize                            int    // default is 100
+	RecoverUseBalanceDBConnection               bool   // default is false
+	RecoverUseBalanceDBConnectionLocalityFilter string // default is empty
+	CliCtx                                      *clicfg.Context
+	ConnCtx                                     *clisqlclient.Context
+	ExecCtx                                     *clisqlexec.Context
 }
 
-// setRecoverfromcdcContextDefaults set the default values in recoverfromcdcCtx.  This
+// setRecoverFromCDCContextDefaults set the default values in recoverfromcdcCtx.  This
 // function is called by initCLIDefaults() and thus re-called in every
 // test that exercises command-line parsing.
-func setRecoverfromcdcContextDefaults() {
+func setRecoverFromCDCContextDefaults() {
 	recoverfromcdcCtx.CliCtx = &cliCtx.Context
 	recoverfromcdcCtx.ConnCtx = &clisqlclient.Context{}
 	recoverfromcdcCtx.ExecCtx = &clisqlexec.Context{}
-	recoverfromcdcCtx.RecoverCockroachDBName = "defaultdb"
-	recoverfromcdcCtx.RecoverCockroachTableName = ""
-	recoverfromcdcCtx.RecoverKafkaBootstrapServer = ""
-	recoverfromcdcCtx.RecoverKafkaTopicName = ""
-	recoverfromcdcCtx.RecoverKafkaTopicPartition = ""
-	recoverfromcdcCtx.RecoverStartTimestamp = "1970-01-01 00:00:00"
-	recoverfromcdcCtx.RecoverStartKafkaOffset = 0
-	recoverfromcdcCtx.RecoverKafkaCommandConfigFile = ""
+	recoverfromcdcCtx.RecoverCockroachDBName = RecoverCockroachDBNameDefault
+	recoverfromcdcCtx.RecoverCockroachTableName = EmptyString
+	recoverfromcdcCtx.RecoverKafkaBootstrapServer = EmptyString
+	recoverfromcdcCtx.RecoverKafkaTopicName = EmptyString
+	recoverfromcdcCtx.RecoverKafkaTopicPartitions = EmptyString
+	recoverfromcdcCtx.RecoverStartTimestamp = RecoverStartTimestampDefault
+	recoverfromcdcCtx.RecoverKafkaStartOffset = KafkaStartOffsetDefault
+	recoverfromcdcCtx.RecoverEndTimestamp = EmptyString
+	recoverfromcdcCtx.RecoverKafkaEndOffset = KafkaStartOffsetDefault // use the same default as start offset, meaning no end offset specified.
+	recoverfromcdcCtx.RecoverKafkaCommandConfigFile = EmptyString
+	recoverfromcdcCtx.RecoverBatchSize = RecoverBatchSizeDefault
+	recoverfromcdcCtx.RecoverUseBalanceDBConnection = false
+	recoverfromcdcCtx.RecoverUseBalanceDBConnectionLocalityFilter = EmptyString
 }

@@ -1986,11 +1986,11 @@ The optional kafka config file which can provide authentication, consumer config
 The cockroach table name to recover.`,
 	}
 
-	RecoverKafkaTopicPartition = FlagInfo{
-		Name: "recover-kafka-topic-partition",
+	RecoverKafkaTopicPartitions = FlagInfo{
+		Name: "recover-kafka-topic-partitions",
 		Description: `
-The partition number of the kafka topic to recover. It's rare to pin the recovery 
-to a single kafka partition, unless parallel recover processes are started. 
+The list of partition number of the kafka topic to recover. It's rare to pin the recovery 
+to a list of kafka partitions, unless parallel recover processes are started. 
 
 When this is left empty, the recovery will check how many partitions the topic has,
 and spawn the corresponding number of kafka consumers (go routines) to consume each 
@@ -2000,17 +2000,80 @@ partition and write to the cockroach db.`,
 	RecoverStartTimestamp = FlagInfo{
 		Name: "recover-start-timestamp",
 		Description: `
-The timestamp the recover will start from the kafka topic.  this needs the cockroach
-changefeed option 'update' to set, so it can scan the topic with the mvcc timestamp.
+The timestamp the recover will start from the kafka topic. 
 
-The format will be YYYY-MM-DD HH24:MI:SS.nnnnnnn, and internally convert to the epoch
-nano seconds to compare with the mvcc timestamp in the CDC kafka message.`,
+This needs the cockroach changefeed option 'update' to set, so it can scan the topic with the mvcc timestamp.
+
+The format will be YYYY-MM-DDTHH:MI:SS.999999999Z0:00, and internally convert to the epoch
+nano seconds to compare with the mvcc timestamp in the CDC kafka message.The time zone
+should be UTC.`,
 	}
 
-	RecoverStartKafkaOffset = FlagInfo{
+	RecoverKafkaStartOffset = FlagInfo{
 		Name: "recover-kafka-start-offset",
 		Description: `
-The kafka offset the recover to start from.  This could be different for different 
-kafka partitions. `,
+The kafka offset the recover to start from.
+
+Note: This could be different for different kafka partitions.`,
+	}
+
+	RecoverEndTimestamp = FlagInfo{
+		Name: "recover-end-timestamp",
+		Description: `
+The timestamp the recover will end from the kafka topic. It's optional, default to empty string, which means
+the recoverfromcdc will replay/apply Kafka messages till the last messages in the kafka topic till the 
+point in time of the failure. However, there are use cases where the recovery needs to be stopped at certain time
+or kafka partition offset (see recover-kafka-end-offset). 
+
+This needs the cockroach changefeed option 'update' to set, so it can scan the topic with the mvcc timestamp.
+
+The format will be YYYY-MM-DDTHH:MI:SS.999999999Z0:00, and internally convert to the epoch
+nano seconds to compare with the mvcc timestamp in the CDC kafka message.The time zone
+should be UTC.`,
+	}
+
+	RecoverKafkaEndOffset = FlagInfo{
+		Name: "recover-kafka-end-offset",
+		Description: `
+The kafka offset the recover to end.  It's optional, default to 0, which means
+the recoverfromcdc will replay/apply Kafka messages till the last messages in the kafka topic partitions till the 
+point in time of the failure. However, there are use cases where the recovery needs to be stopped at certain time
+or kafka partition offset (see recover-kafka-end-offset). 
+
+Note: This could be different for different kafka partitions.`,
+	}
+
+	RecoverBatchSize = FlagInfo{
+		Name: "recover-batch-size",
+		Description: `
+The batch size to upsert/delete after consuming from CDC. Tuning this to try to achieve  
+the optimal throughput. The default is 100.`,
+	}
+
+	RecoverUseBalanceDBConnection = FlagInfo{
+		Name: "recover-use-balance-db-connection",
+		Description: `
+When this is set to true, it will use the db connection from the cockroach CLI as the gateway node for all kafka
+topic partitions upsert/delete. This could overload that particular node even the lease-holders are distributed
+across all the nodes in the cluster. However, there are use cases where this is the intended, for example, when
+pinning to certain partition(s) and start multiple cockroach recoverfromcdc processes on one or multiple client
+hosts. So the default is false. 
+
+This is similar to the kafka bootstrap server, where the first node is used to fetch metadata about the topology 
+of the cockroachdb cluster and discover/route traffic to other nodes to avoid overloading one gateway node. The
+algorithm for the balanace is round-robin.  Each partition has 2 database connections. one for upsert, and the 
+other for delete. The balance is also one-time in the beginning. No rebalance for cases like node failure, 
+drain, decommission, cluster expansion with new nodes after the recoverfromcdc is kicked off. Future enhancements
+will include rebalance based on the cpu load of the gateway nodes, upsert/delete query latency.  
+
+The recover-use-balance-db-connection-locality-filter can be used to filter only part of the nodes in the cluster.`,
+	}
+
+	RecoverUseBalanceDBConnectionLocalityFilter = FlagInfo{
+		Name: "recover-use-balance-db-connection-locality-filter",
+		Description: `
+When this is specified, it will filter out only part of the nodes in the cluster. 
+
+for example: "region=us-east-1,datacenter=ash1", see crdb_internal.gossip_nodes's locality`,
 	}
 )

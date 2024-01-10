@@ -54,6 +54,20 @@ func IntFlagDepth(depth int, f *pflag.FlagSet, valPtr *int, flagInfo cliflags.Fl
 	registerEnvVarDefault(f, flagInfo, depth+1)
 }
 
+// Int64Flag creates an int64 flag and registers it with the FlagSet.
+// The default value is taken from the variable pointed to by valPtr.
+// See cli/context.go to initialize defaults.
+func Int64Flag(f *pflag.FlagSet, valPtr *int64, flagInfo cliflags.FlagInfo) {
+	Int64FlagDepth(1, f, valPtr, flagInfo)
+}
+
+// Int64FlagDepth is like Int64Flag but the caller can control the
+// call level at which the env var usage assertion is done.
+func Int64FlagDepth(depth int, f *pflag.FlagSet, valPtr *int64, flagInfo cliflags.FlagInfo) {
+	f.Int64VarP(valPtr, flagInfo.Name, flagInfo.Shorthand, *valPtr, flagInfo.Usage())
+	registerEnvVarDefault(f, flagInfo, depth+1)
+}
+
 // BoolFlag creates a bool flag and registers it with the FlagSet.
 // The default value is taken from the variable pointed to by valPtr.
 // See cli/context.go to initialize defaults.
