@@ -49,7 +49,7 @@ var recoverfromcdcCmd = &cobra.Command{
 
 const (
 	// BatchTimeout is the number of milliseconds to force to send the batch. in case of a slow consumer, which could take a long time to reach the batch size
-	BatchTimeout = 1000 * time.Millisecond
+	BatchTimeout = 2000 * time.Millisecond
 	// ReportInterval is the number of seconds to report the progress of the recovery  for each partition.
 	ReportInterval = 10 * time.Second
 	// ConsumerMaxMessageBytes is the message bytes for the consumer to fetch
@@ -291,6 +291,8 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 	saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
 	saramaConfig.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.BalanceStrategySticky}
 	saramaConfig.Consumer.Return.Errors = true
+	// increase when seeing "abandoned subscription to...because consuming was taking too long" or check slow writing to destination
+	saramaConfig.Consumer.MaxProcessingTime = 1000 * time.Millisecond
 	// The sarama.V2_1_0_0 can support zstd compression
 	saramaConfig.Version = sarama.V2_1_0_0
 
@@ -475,10 +477,10 @@ func getPartitions(c sarama.Consumer) ([]int32, error) {
 func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, partition int32, batchSize int, conns map[string]*pgxpool.Pool, closing chan struct{}, recoverStartTimestampEpochNanoSeconds float64, pkColumns []string) error {
 	var currentOffset int64
 	var msgType string
-	var rowImage interface{}
+	var rowImage map[string]interface{}
 	var updatedTimestamp float64
 	fmt.Printf("consuming pc.Messages() for partition: %v, batchSize: %v\n", partition, batchSize)
-	msgBatch := make(map[string]map[string]interface{})
+	msgBatch := make(map[string]map[string]map[string]interface{})
 	count := 0
 	// set the 1-second timeout for now or the batchSize, which ever is reached first.
 	batchTimeoutTicker := time.NewTicker(BatchTimeout)
@@ -514,7 +516,11 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 			//fmt.Printf("message, Partition: %v\nOffset: %v, HighWaterMark: %v\nkey: %s\nvalue: %s\n", message.Partition, message.Offset, pc.HighWaterMarkOffset(), message.Key, message.Value)
 			count++
 			var jsonMap map[string]interface{}
-			err := json.Unmarshal(message.Value, &jsonMap)
+			// The default convert to float64 using err := json.Unmarshal(message.Value, &jsonMap)
+			decoderString := json.NewDecoder(strings.NewReader(string(message.Value)))
+			decoderString.UseNumber()
+			err := decoderString.Decode(&jsonMap)
+			// fmt.Printf("jsonMap: %v\n", jsonMap)
 			if err != nil {
 				fmt.Printf("Error parsing mesage: %v in partition: %v, Exiting this goroutine\n", message.Value, partition)
 				return errors.Wrapf(err, "Error parsing mesage: %v in partition: %v, Exiting this goroutine\n", message.Value, partition)
@@ -528,9 +534,9 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 			// Since within the batchSize window, there could be duplicated Message Key,
 			// instead of using the condition (count % batchSize !=0),  use (len(msgBatch) < batchSize)
 			if (len(msgBatch) < batchSize) && !filterCDCMessage(msgType, recoverfromcdcCtx.RecoverKafkaStartOffset, recoverStartTimestampEpochNanoSeconds, currentOffset, updatedTimestamp) {
-				fmt.Printf("rowImage: %v, updatedTimestamp: %f\n", rowImage, updatedTimestamp)
+				//fmt.Printf("rowImage: %v, updatedTimestamp: %f\n", rowImage, updatedTimestamp)
 				// This will de-dup using the Message.Key. usually this is the PK column(s).
-				msgBatch[string(message.Key)] = map[string]interface{}{msgType: rowImage}
+				msgBatch[string(message.Key)] = map[string]map[string]interface{}{msgType: rowImage}
 				// the bucket reached the batchSize, set it to
 				if len(msgBatch) == batchSize {
 					sendBatchNow = true
@@ -543,13 +549,13 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 			sendBatchNow = false
 			// if the batch has at least one record.
 			if len(msgBatch) > 0 {
-				err := processBatch(pcCtx, conns, msgBatch, closing, pkColumns)
+				err := processBatch(pcCtx, partition, conns, msgBatch, closing, pkColumns)
 				if err != nil {
 					fmt.Printf("Error writing to the DB after retries for partition: %v, currentOffset: %v, Exiting this goroutine\n", partition, currentOffset)
 					return errors.Wrapf(err, "Error writing to the DB after retries for partition: %v, currentOffset: %v, Exiting this goroutine", partition, currentOffset)
 				}
 				// make a new map, the old one with no reference should be garbage-collected. Go 1.21 has clear(map)
-				msgBatch = make(map[string]map[string]interface{})
+				msgBatch = make(map[string]map[string]map[string]interface{})
 			}
 		}
 	}
@@ -557,20 +563,28 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 
 // processBatch processes the data as upsert and delete and submit the query to the DB.
 // It will retry 3 times (to-do to parameterize this) if errors are found.
-func processBatch(ctx context.Context, conns map[string]*pgxpool.Pool, data map[string]map[string]interface{}, closing chan struct{}, pkColumns []string) error {
+func processBatch(ctx context.Context, partition int32, conns map[string]*pgxpool.Pool, data map[string]map[string]map[string]interface{}, closing chan struct{}, pkColumns []string) error {
 	// dataDelete holds all the delete messages beforeImage to get the list of PK Column(s)
 	var dataDelete = make(map[string]map[string]interface{})
 	// dataUpsert holds all the afterImage of the rows to be inserted/updated
 	var dataUpsert = make(map[string]map[string]interface{})
-	fmt.Printf("DEBUG processBatch(), len(data): %v\n", len(data))
+	fmt.Printf("DEBUG processBatch(), partition: %v, len(data): %v\n", partition, len(data))
+	// REMOVE this: one-time debug code, check any duplicates of the column `id`
+	for msgKey, msgData := range data {
+		for msgType, rowImageMap := range msgData {
+			//for rowImageMapKey, rowImageMapValue := range rowImageMap {
+			//	fmt.Printf("rowImageMapKey: %s, rowImageMapValue: %s\n", rowImageMapKey, rowImageMapValue)
+			//}
+			idString := fmt.Sprintf("[%s]", rowImageMap["id"].(json.Number))
+			if msgType == CDCMessageTypeUpsert && msgKey != idString {
+				fmt.Printf("found msgKey: %s not equal to the PK id: %s	\n", msgKey, idString)
+			}
+		}
+	}
 	// separate the Upsert & Delete Batch, they can be executed in parallel against the CockroachDB, since the ordering in the same partition and de-dup on the same Msg Key -> PK column(s)
 	for msgKey, msgData := range data {
-		for msgType, rowImage := range msgData {
-			rowImageMap, err := convertInterfaceToMap(rowImage)
-			if err != nil {
-				fmt.Printf("processBatch(), convertInterfaceToMap encounters an error: %v", err)
-				return errors.Wrapf(err, "processBatch() convertInterfaceToMap encounters an error.")
-			}
+		for msgType, rowImageMap := range msgData {
+			//rowImageMap, err := convertInterfaceToMap(rowImage)
 			if msgType == CDCMessageTypeUpsert {
 				dataUpsert[msgKey] = rowImageMap
 				continue
@@ -611,15 +625,19 @@ func processBatch(ctx context.Context, conns map[string]*pgxpool.Pool, data map[
 // if it has the "resolved" key, then return  ("resolved", nil, 0, nil)
 // if it has the "updated" key only,  then return ("updated", nil, updated_timestamp_echo_nanoseconds, nil)
 // else return ("unknown", nil, 0.0, error)
-func parseCDCMessage(jsonMap map[string]interface{}) (string, interface{}, float64, error) {
+func parseCDCMessage(jsonMap map[string]interface{}) (string, map[string]interface{}, float64, error) {
 	afterImage, ok := jsonMap[CDCKeyAfter]
 	if ok && afterImage != nil {
 		updateTimestampFloat, err := parseCDCMessageUpdatedTimestamp(jsonMap)
 		if err != nil {
 			return CDCMessageTypeUnknown, nil, updateTimestampFloat, err
 		}
+		afterImageMap, err := convertInterfaceToMap(afterImage)
+		if err != nil {
+			return CDCMessageTypeUnknown, nil, 0.0, err
+		}
 		// This short circuits the other types, the upsert includes insert with only after image), and update with both before/after image.
-		return CDCMessageTypeUpsert, afterImage, updateTimestampFloat, nil
+		return CDCMessageTypeUpsert, afterImageMap, updateTimestampFloat, nil
 	}
 
 	beforeImage, ok := jsonMap[CDCKeyBefore]
@@ -629,7 +647,11 @@ func parseCDCMessage(jsonMap map[string]interface{}) (string, interface{}, float
 		if err != nil {
 			return CDCMessageTypeUnknown, nil, updateTimestampFloat, err
 		}
-		return CDCMessageTypeDelete, beforeImage, updateTimestampFloat, nil
+		beforeImageMap, err := convertInterfaceToMap(beforeImage)
+		if err != nil {
+			return CDCMessageTypeUnknown, nil, 0.0, err
+		}
+		return CDCMessageTypeDelete, beforeImageMap, updateTimestampFloat, nil
 	}
 
 	_, ok = jsonMap[CDCKeyUpdated]
@@ -657,12 +679,12 @@ func parseCDCMessageUpdatedTimestamp(jsonMap map[string]interface{}) (float64, e
 	}
 	updateTimestampString, ok := updateTimestamp.(string)
 	if !ok {
-		return 0.0, errors.Errorf("updated not string: %s", updateTimestamp)
+		return 0.0, errors.Errorf("updated not string: %v", updateTimestamp)
 	}
 
 	updateTimestampFloat, err := strconv.ParseFloat(updateTimestampString, 64)
 	if err != nil {
-		return 0.0, errors.Wrapf(err, "updated string to float conversion error: %s", updateTimestampString)
+		return 0.0, errors.Wrapf(err, "updated string to float conversion error: %s", updateTimestamp)
 	}
 	return updateTimestampFloat, nil
 }
@@ -692,6 +714,7 @@ func filterCDCMessage(msgType string, recoverStartOffset int64, recoverStartTime
 func doUpsert(ctx context.Context, conn *pgxpool.Pool, dbName string, tableName string, closing chan struct{}, data map[string]map[string]interface{}) error {
 	var columnNamesMap = make(map[string]struct{})
 	var columnNamesSortedSlice []string
+	//var queryParams []interface{}
 	var queryParams []interface{}
 	select {
 	case <-ctx.Done():
@@ -762,10 +785,10 @@ func doUpsert(ctx context.Context, conn *pgxpool.Pool, dbName string, tableName 
 				queryParams = append(queryParams, columnValue)
 			}
 		}
-		fmt.Printf("doUpsert() DEBUG, sqlStmt: %v, queryParams: %v\n", sqlStmt, queryParams)
+		// fmt.Printf("doUpsert() DEBUG, sqlStmt: %v, queryParams: %v\n", sqlStmt, queryParams)
 		err := dbExecuteUpsertDelete(ctx, conn, sqlStmt, queryParams)
 		if err != nil {
-			fmt.Printf("doUpsert() error: \n")
+			fmt.Printf("doUpsert() error: %v, sqlstm: %v, queryParams: %v\n", err, sqlStmt, queryParams)
 			return errors.Wrapf(err, "doUpsert() error: ")
 		}
 
@@ -775,6 +798,7 @@ func doUpsert(ctx context.Context, conn *pgxpool.Pool, dbName string, tableName 
 
 // doDelete deletes the multi-rows data in one delete statement using the in-clause. e.g. delete from <table> where (pk_col1, pk_col2...) in ( (<value1>, <value2>...), (<value3>, <value4>...))
 func doDelete(ctx context.Context, conn *pgxpool.Pool, dbName string, tableName string, closing chan struct{}, pkColumns []string, data map[string]map[string]interface{}) error {
+	//var queryParams []interface{}
 	var queryParams []interface{}
 	select {
 	case <-ctx.Done():
@@ -822,13 +846,18 @@ func doDelete(ctx context.Context, conn *pgxpool.Pool, dbName string, tableName 
 					fmt.Printf("doDelete() pk column name: %v not found in rowImageMap: %v\n", pkColumnName, rowImage)
 					return errors.Errorf("doDelete() pk column name: %v not found in rowImageMap: %v", pkColumnName, rowImage)
 				}
-				queryParams = append(queryParams, pkColumnValue)
+				pkColumnValueString, ok := pkColumnValue.(string)
+				if !ok {
+					fmt.Printf("dbUpsert(): error converting columnValue: %v to string\n", pkColumnValue)
+					return errors.Errorf("dbUpsert(): error converting columnValue: %v to string", pkColumnValue)
+				}
+				queryParams = append(queryParams, pkColumnValueString)
 			}
 		}
-		fmt.Printf("doDelete() DEBUG, sqlStmt: %s, queryParams: %v\n", sqlStmt, queryParams)
+		// fmt.Printf("doDelete() DEBUG, sqlStmt: %s, queryParams: %v\n", sqlStmt, queryParams)
 		err := dbExecuteUpsertDelete(ctx, conn, sqlStmt, queryParams)
 		if err != nil {
-			fmt.Printf("doDelete() error: \n")
+			fmt.Printf("doDelete() error: %v, sqlstmt: %v, queryParams: %v\n", err, sqlStmt, queryParams)
 			return errors.Wrapf(err, "doDelete() error: ")
 		}
 
@@ -848,7 +877,12 @@ func convertInterfaceToMap(rowImage interface{}) (map[string]interface{}, error)
 
 // dbExecuteUpsertDelete executes the upsert/delete (and other) SQL statements
 func dbExecuteUpsertDelete(ctx context.Context, conn *pgxpool.Pool, sqlStmt string, queryParams []interface{}) error {
+	//func dbExecuteUpsertDelete(ctx context.Context, conn *pgxpool.Pool, sqlStmt string, queryParams []interface{}) error {
 	var dbErr error
+	//queryParamsAny := make([]any, len(queryParams))
+	//for i, queryParamAny := range queryParams {
+	//	queryParamsAny[i] = queryParamAny
+	//}
 	for i := 0; i <= DBErrorRetriesDefault; i++ {
 		// ignore the pgconn.CommandTag{} for now
 		_, dbErr = conn.Exec(ctx, sqlStmt, queryParams...)
