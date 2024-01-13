@@ -293,6 +293,8 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 	saramaConfig.Consumer.Return.Errors = true
 	// increase when seeing "abandoned subscription to...because consuming was taking too long" or check slow writing to destination
 	saramaConfig.Consumer.MaxProcessingTime = 1000 * time.Millisecond
+	// Increase Retry in case of client/metadata got error from broker <broker.id> while fetching metadata: EOF
+	saramaConfig.Metadata.Retry.Max = 100000
 	// The sarama.V2_1_0_0 can support zstd compression
 	saramaConfig.Version = sarama.V2_1_0_0
 
@@ -570,17 +572,17 @@ func processBatch(ctx context.Context, partition int32, conns map[string]*pgxpoo
 	var dataUpsert = make(map[string]map[string]interface{})
 	fmt.Printf("DEBUG processBatch(), partition: %v, len(data): %v\n", partition, len(data))
 	// REMOVE this: one-time debug code, check any duplicates of the column `id`
-	for msgKey, msgData := range data {
-		for msgType, rowImageMap := range msgData {
-			//for rowImageMapKey, rowImageMapValue := range rowImageMap {
-			//	fmt.Printf("rowImageMapKey: %s, rowImageMapValue: %s\n", rowImageMapKey, rowImageMapValue)
-			//}
-			idString := fmt.Sprintf("[%s]", rowImageMap["id"].(json.Number))
-			if msgType == CDCMessageTypeUpsert && msgKey != idString {
-				fmt.Printf("found msgKey: %s not equal to the PK id: %s	\n", msgKey, idString)
-			}
-		}
-	}
+	//for msgKey, msgData := range data {
+	//	for msgType, rowImageMap := range msgData {
+	//for rowImageMapKey, rowImageMapValue := range rowImageMap {
+	//	fmt.Printf("rowImageMapKey: %s, rowImageMapValue: %s\n", rowImageMapKey, rowImageMapValue)
+	//}
+	//		idString := fmt.Sprintf("[%s]", rowImageMap["id"].(json.Number))
+	//		if msgType == CDCMessageTypeUpsert && msgKey != idString {
+	//			fmt.Printf("found msgKey: %s not equal to the PK id: %s	\n", msgKey, idString)
+	//		}
+	//	}
+	//}
 	// separate the Upsert & Delete Batch, they can be executed in parallel against the CockroachDB, since the ordering in the same partition and de-dup on the same Msg Key -> PK column(s)
 	for msgKey, msgData := range data {
 		for msgType, rowImageMap := range msgData {
