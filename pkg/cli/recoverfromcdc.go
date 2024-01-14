@@ -50,8 +50,8 @@ var recoverfromcdcCmd = &cobra.Command{
 const (
 	// BatchTimeout is the number of milliseconds to force to send the batch. in case of a slow consumer, which could take a long time to reach the batch size
 	BatchTimeout = 2000 * time.Millisecond
-	// ReportInterval is the number of seconds to report the progress of the recovery  for each partition.
-	ReportInterval = 10 * time.Second
+	// ReportIntervalSeconds is the number of seconds to report the progress of the recovery  for each partition.
+	ReportIntervalSeconds = 10
 	// ConsumerMaxMessageBytes is the message bytes for the consumer to fetch
 	ConsumerMaxMessageBytes = 33554432
 	// CDCKeyAfter is the after image of the table row. This can be used to determine what type of the message.  Upsert or Delete
@@ -92,40 +92,42 @@ const (
 	DBConnectionMinRetrySleepSeconds = 1
 	// DBConnectionMaxRetrySleepSeconds is the maximum number of seconds to sleep between retries
 	DBConnectionMaxRetrySleepSeconds = 60
-	SinkParamCACert                  = `ca_cert`
-	SinkParamClientCert              = `client_cert`
-	SinkParamClientKey               = `client_key`
-	SinkParamFileSize                = `file_size`
-	SinkParamPartitionFormat         = `partition_format`
-	SinkParamSchemaTopic             = `schema_topic`
-	SinkParamTLSEnabled              = `tls_enabled`
-	SinkParamSkipTLSVerify           = `insecure_tls_skip_verify`
-	SinkParamTopicPrefix             = `topic_prefix`
-	SinkParamTopicName               = `topic_name`
-	SinkSchemeCloudStorageAzure      = `azure`
-	SinkSchemeCloudStorageGCS        = `gs`
-	SinkSchemeCloudStorageHTTP       = `http`
-	SinkSchemeCloudStorageHTTPS      = `https`
-	SinkSchemeCloudStorageNodelocal  = `nodelocal`
-	SinkSchemeCloudStorageS3         = `s3`
-	SinkSchemeExperimentalSQL        = `experimental-sql`
-	SinkSchemeHTTP                   = `http`
-	SinkSchemeHTTPS                  = `https`
-	SinkSchemeKafka                  = `kafka`
-	SinkSchemeNull                   = `null`
-	SinkSchemeWebhookHTTP            = `webhook-http`
-	SinkSchemeWebhookHTTPS           = `webhook-https`
-	SinkSchemeExternalConnection     = `external`
-	SinkParamSASLEnabled             = `sasl_enabled`
-	SinkParamSASLHandshake           = `sasl_handshake`
-	SinkParamSASLUser                = `sasl_user`
-	SinkParamSASLPassword            = `sasl_password`
-	SinkParamSASLMechanism           = `sasl_mechanism`
-	SinkParamSASLClientID            = `sasl_client_id`
-	SinkParamSASLClientSecret        = `sasl_client_secret`
-	SinkParamSASLTokenURL            = `sasl_token_url`
-	SinkParamSASLScopes              = `sasl_scopes`
-	SinkParamSASLGrantType           = `sasl_grant_type`
+	// ReportSectionDivider is the section divider for pretty printing
+	ReportSectionDivider            = "============================================================================================================="
+	SinkParamCACert                 = `ca_cert`
+	SinkParamClientCert             = `client_cert`
+	SinkParamClientKey              = `client_key`
+	SinkParamFileSize               = `file_size`
+	SinkParamPartitionFormat        = `partition_format`
+	SinkParamSchemaTopic            = `schema_topic`
+	SinkParamTLSEnabled             = `tls_enabled`
+	SinkParamSkipTLSVerify          = `insecure_tls_skip_verify`
+	SinkParamTopicPrefix            = `topic_prefix`
+	SinkParamTopicName              = `topic_name`
+	SinkSchemeCloudStorageAzure     = `azure`
+	SinkSchemeCloudStorageGCS       = `gs`
+	SinkSchemeCloudStorageHTTP      = `http`
+	SinkSchemeCloudStorageHTTPS     = `https`
+	SinkSchemeCloudStorageNodelocal = `nodelocal`
+	SinkSchemeCloudStorageS3        = `s3`
+	SinkSchemeExperimentalSQL       = `experimental-sql`
+	SinkSchemeHTTP                  = `http`
+	SinkSchemeHTTPS                 = `https`
+	SinkSchemeKafka                 = `kafka`
+	SinkSchemeNull                  = `null`
+	SinkSchemeWebhookHTTP           = `webhook-http`
+	SinkSchemeWebhookHTTPS          = `webhook-https`
+	SinkSchemeExternalConnection    = `external`
+	SinkParamSASLEnabled            = `sasl_enabled`
+	SinkParamSASLHandshake          = `sasl_handshake`
+	SinkParamSASLUser               = `sasl_user`
+	SinkParamSASLPassword           = `sasl_password`
+	SinkParamSASLMechanism          = `sasl_mechanism`
+	SinkParamSASLClientID           = `sasl_client_id`
+	SinkParamSASLClientSecret       = `sasl_client_secret`
+	SinkParamSASLTokenURL           = `sasl_token_url`
+	SinkParamSASLScopes             = `sasl_scopes`
+	SinkParamSASLGrantType          = `sasl_grant_type`
 )
 
 type kafkaDialConfig struct {
@@ -477,16 +479,18 @@ func getPartitions(c sarama.Consumer) ([]int32, error) {
 
 // fetchPartitionConsumer fetches messages from by partition, by batch and de-dup by the message key
 func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, partition int32, batchSize int, conns map[string]*pgxpool.Pool, closing chan struct{}, recoverStartTimestampEpochNanoSeconds float64, pkColumns []string) error {
-	var currentOffset int64
+	var currentOffset, rowsUpserted, rowsDeleted, previousRowsUpserted, previousRowsDeleted, queriesUpserted, queriesDeleted, previousQueriesUpserted, previousQueriesDeleted int64
 	var msgType string
 	var rowImage map[string]interface{}
 	var updatedTimestamp float64
+	rowsUpserted, rowsDeleted, previousRowsUpserted, previousRowsDeleted, queriesUpserted, queriesDeleted, previousQueriesUpserted, previousQueriesDeleted = 0, 0, 0, 0, 0, 0, 0, 0
 	fmt.Printf("consuming pc.Messages() for partition: %v, batchSize: %v\n", partition, batchSize)
 	msgBatch := make(map[string]map[string]map[string]interface{})
 	count := 0
+	duplicateCount := 0
 	// set the 1-second timeout for now or the batchSize, which ever is reached first.
 	batchTimeoutTicker := time.NewTicker(BatchTimeout)
-	reportTicker := time.NewTicker(ReportInterval)
+	reportTicker := time.NewTicker(ReportIntervalSeconds * time.Second)
 	defer func() {
 		batchTimeoutTicker.Stop()
 		reportTicker.Stop()
@@ -504,11 +508,22 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 			// if after the timeout (e.g. slow consumer), force it to write to the DB.
 			sendBatchNow = true
 		case <-reportTicker.C:
-			// have a function for report
-			fmt.Printf("======================================================\n")
-			fmt.Printf("Report progress every %v seconds. for partition: %v, Current Offset: %v, High Water Mark: %v, Remaining offsets: %v, updatedTimstamp epoch nanoseconds: %f, updateMVCCTime: %v\n", ReportInterval, partition, currentOffset, pc.HighWaterMarkOffset(), pc.HighWaterMarkOffset()-currentOffset, updatedTimestamp, time.Unix(int64(updatedTimestamp/1000000000), int64(updatedTimestamp)%1000000000).UTC())
-			fmt.Printf("Total messages consumed so far: %v\n", count)
-			fmt.Printf("======================================================\n")
+			// TODO(gli): have a function for report, these also can be published as metrics via cockroach's HTTP prometheus endpoint: /_status/vars
+			fmt.Printf("%s\n", ReportSectionDivider)
+			fmt.Printf("Report progress every %v seconds. for partition: %v, Current Offset: %v, High Water Mark: %v, Remaining offsets: %v, updatedTimstamp epoch nanoseconds: %f, updateMVCCTime: %v\n", ReportIntervalSeconds, partition, currentOffset, pc.HighWaterMarkOffset(), pc.HighWaterMarkOffset()-currentOffset, updatedTimestamp, time.Unix(int64(updatedTimestamp/1000000000), int64(updatedTimestamp)%1000000000).UTC())
+
+			upsertRowsPerSecond := int((rowsUpserted - previousRowsUpserted) / ReportIntervalSeconds)
+			previousRowsUpserted = rowsUpserted
+			deleteRowsPerSecond := int((rowsDeleted - previousRowsDeleted) / ReportIntervalSeconds)
+			previousRowsDeleted = rowsDeleted
+
+			upsertQueriesPerSecond := int((queriesUpserted - previousQueriesUpserted) / ReportIntervalSeconds)
+			previousQueriesUpserted = queriesUpserted
+			deleteQueriesPerSecond := int((queriesDeleted - previousQueriesDeleted) / ReportIntervalSeconds)
+			previousQueriesDeleted = queriesDeleted
+
+			fmt.Printf("Total messages consumed: %v, duplicated: %v, upserted: %v, deleted: %v, throughput(rows/second), upsert: %v, delete : %v, QPS, upsert: %v, delete: %v\n", count, duplicateCount, rowsUpserted, rowsDeleted, upsertRowsPerSecond, deleteRowsPerSecond, upsertQueriesPerSecond, deleteQueriesPerSecond)
+			fmt.Printf("%s\n", ReportSectionDivider)
 		case pcErr := <-pc.Errors():
 			fmt.Printf("partition: %v consumer error: %v\n", partition, pcErr)
 			return errors.Wrapf(pcErr, "partition: %v consumer error", partition)
@@ -537,6 +552,9 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 			// instead of using the condition (count % batchSize !=0),  use (len(msgBatch) < batchSize)
 			if (len(msgBatch) < batchSize) && !filterCDCMessage(msgType, recoverfromcdcCtx.RecoverKafkaStartOffset, recoverStartTimestampEpochNanoSeconds, currentOffset, updatedTimestamp) {
 				//fmt.Printf("rowImage: %v, updatedTimestamp: %f\n", rowImage, updatedTimestamp)
+				if _, ok := msgBatch[string(message.Key)]; ok {
+					duplicateCount++
+				}
 				// This will de-dup using the Message.Key. usually this is the PK column(s).
 				msgBatch[string(message.Key)] = map[string]map[string]interface{}{msgType: rowImage}
 				// the bucket reached the batchSize, set it to
@@ -551,13 +569,24 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 			sendBatchNow = false
 			// if the batch has at least one record.
 			if len(msgBatch) > 0 {
-				err := processBatch(pcCtx, partition, conns, msgBatch, closing, pkColumns)
+				batchRowsUpserted, batchRowsDeleted, batchQueriesUpserted, batchQueriesDeleted, err := processBatch(pcCtx, partition, conns, msgBatch, closing, pkColumns)
+				rowsUpserted += int64(batchRowsUpserted)
+				rowsDeleted += int64(batchRowsDeleted)
+				queriesUpserted += int64(batchQueriesUpserted)
+				queriesDeleted += int64(batchQueriesDeleted)
 				if err != nil {
 					fmt.Printf("Error writing to the DB after retries for partition: %v, currentOffset: %v, Exiting this goroutine\n", partition, currentOffset)
 					return errors.Wrapf(err, "Error writing to the DB after retries for partition: %v, currentOffset: %v, Exiting this goroutine", partition, currentOffset)
 				}
 				// make a new map, the old one with no reference should be garbage-collected. Go 1.21 has clear(map)
 				msgBatch = make(map[string]map[string]map[string]interface{})
+				// reset the batchTimeoutTicker
+				batchTimeoutTicker.Stop()
+				select {
+				case <-batchTimeoutTicker.C:
+				default:
+				}
+				batchTimeoutTicker.Reset(BatchTimeout)
 			}
 		}
 	}
@@ -565,11 +594,12 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 
 // processBatch processes the data as upsert and delete and submit the query to the DB.
 // It will retry 3 times (to-do to parameterize this) if errors are found.
-func processBatch(ctx context.Context, partition int32, conns map[string]*pgxpool.Pool, data map[string]map[string]map[string]interface{}, closing chan struct{}, pkColumns []string) error {
+func processBatch(ctx context.Context, partition int32, conns map[string]*pgxpool.Pool, data map[string]map[string]map[string]interface{}, closing chan struct{}, pkColumns []string) (int, int, int, int, error) {
 	// dataDelete holds all the delete messages beforeImage to get the list of PK Column(s)
 	var dataDelete = make(map[string]map[string]interface{})
 	// dataUpsert holds all the afterImage of the rows to be inserted/updated
 	var dataUpsert = make(map[string]map[string]interface{})
+	upsertQueryCount, deleteQueryCount := 0, 0
 	fmt.Printf("DEBUG processBatch(), partition: %v, len(data): %v\n", partition, len(data))
 	// REMOVE this: one-time debug code, check any duplicates of the column `id`
 	//for msgKey, msgData := range data {
@@ -605,20 +635,25 @@ func processBatch(ctx context.Context, partition int32, conns map[string]*pgxpoo
 			}
 			return err
 		})
+		upsertQueryCount = 1
 	}
 	if len(dataDelete) > 0 {
 		dbExecuteGroup.Go(func() error {
 			err := doDelete(dbExecuteCtx, conns[CDCMessageTypeDelete], recoverfromcdcCtx.RecoverCockroachDBName, recoverfromcdcCtx.RecoverCockroachTableName, closing, pkColumns, dataDelete)
+			if err != nil {
+				fmt.Printf("Error dbDelete(), err: %v, dataDelete: %v\n", err, dataDelete)
+			}
 			return err
 		})
+		deleteQueryCount = 1
 	}
 
 	// Wait for all partition consumers to complete, check the error.
 	if err := dbExecuteGroup.Wait(); err != nil {
 		fmt.Printf("dbExecuteGroup encounters an error: %v", err)
-		return errors.Wrapf(err, "dbExecuteGroup encounters an error")
+		return 0, 0, 0, 0, errors.Wrapf(err, "dbExecuteGroup encounters an error")
 	}
-	return nil
+	return len(dataUpsert), len(dataDelete), upsertQueryCount, deleteQueryCount, nil
 }
 
 // parseCDCMessage parses the CDC message jsonMap. and returns the type of the message. See https://www.cockroachlabs.com/docs/stable/changefeed-messages
