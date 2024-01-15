@@ -314,10 +314,11 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 		return errors.Wrapf(err, "Error getting partitions from kafka cluster: %v, topic: %v", recoverfromcdcCtx.RecoverKafkaBootstrapServer, recoverfromcdcCtx.RecoverKafkaTopicName)
 	}
 
-	dbConnPools, err := GetDBConnectionPool(ctx, conn, topicPartitions)
+	dbConnPools, err := GetDBConnectionPool(ctx, conn, topicPartitions, recoverfromcdcCtx.RecoverUseBalanceDBConnection, recoverfromcdcCtx.RecoverUseBalanceDBConnectionLocalityFilter)
 	if err != nil {
 		return errors.Wrapf(err, "Failed to get dbConnPools for topicPartitions: %v\n", topicPartitions)
 	}
+	defer cleanupDBConnPools(dbConnPools)
 
 	var (
 		messages = make(chan *sarama.ConsumerMessage, recoverfromcdcCtx.RecoverBatchSize)
@@ -509,8 +510,8 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 			sendBatchNow = true
 		case <-reportTicker.C:
 			// TODO(gli): have a function for report, these also can be published as metrics via cockroach's HTTP prometheus endpoint: /_status/vars
-			fmt.Printf("%s\n", ReportSectionDivider)
-			fmt.Printf("Report progress every %v seconds. for partition: %v, Current Offset: %v, High Water Mark: %v, Remaining offsets: %v, updatedTimstamp epoch nanoseconds: %f, updateMVCCTime: %v\n", ReportIntervalSeconds, partition, currentOffset, pc.HighWaterMarkOffset(), pc.HighWaterMarkOffset()-currentOffset, updatedTimestamp, time.Unix(int64(updatedTimestamp/1000000000), int64(updatedTimestamp)%1000000000).UTC())
+			//fmt.Printf("%s\n", ReportSectionDivider)
+			updatedMVCCTime := time.Unix(int64(updatedTimestamp/1000000000), int64(updatedTimestamp)%1000000000).UTC()
 
 			upsertRowsPerSecond := int((rowsUpserted - previousRowsUpserted) / ReportIntervalSeconds)
 			previousRowsUpserted = rowsUpserted
@@ -522,7 +523,8 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 			deleteQueriesPerSecond := int((queriesDeleted - previousQueriesDeleted) / ReportIntervalSeconds)
 			previousQueriesDeleted = queriesDeleted
 
-			fmt.Printf("Total messages consumed: %v, duplicated: %v, upserted: %v, deleted: %v, throughput(rows/second), upsert: %v, delete : %v, QPS, upsert: %v, delete: %v\n", count, duplicateCount, rowsUpserted, rowsDeleted, upsertRowsPerSecond, deleteRowsPerSecond, upsertQueriesPerSecond, deleteQueriesPerSecond)
+			fmt.Printf("Report progress every %v seconds. for partition: %v, Current Offset: %v, High Water Mark: %v, Remaining offsets: %v, updatedTimstamp epoch nanoseconds: %f, updateMVCCTime: %v, Time to catchup: %v, Total messages consumed: %v, duplicated: %v, upserted: %v, deleted: %v, throughput(rows/second), upsert: %v, delete : %v, QPS, upsert: %v, delete: %v\n", ReportIntervalSeconds, partition, currentOffset, pc.HighWaterMarkOffset(), pc.HighWaterMarkOffset()-currentOffset, updatedTimestamp, updatedMVCCTime, time.Now().UTC().Sub(updatedMVCCTime), count, duplicateCount, rowsUpserted, rowsDeleted, upsertRowsPerSecond, deleteRowsPerSecond, upsertQueriesPerSecond, deleteQueriesPerSecond)
+			//fmt.Printf("Total messages consumed: %v, duplicated: %v, upserted: %v, deleted: %v, throughput(rows/second), upsert: %v, delete : %v, QPS, upsert: %v, delete: %v\n", count, duplicateCount, rowsUpserted, rowsDeleted, upsertRowsPerSecond, deleteRowsPerSecond, upsertQueriesPerSecond, deleteQueriesPerSecond)
 			fmt.Printf("%s\n", ReportSectionDivider)
 		case pcErr := <-pc.Errors():
 			fmt.Printf("partition: %v consumer error: %v\n", partition, pcErr)
@@ -552,6 +554,7 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 			// instead of using the condition (count % batchSize !=0),  use (len(msgBatch) < batchSize)
 			if (len(msgBatch) < batchSize) && !filterCDCMessage(msgType, recoverfromcdcCtx.RecoverKafkaStartOffset, recoverStartTimestampEpochNanoSeconds, currentOffset, updatedTimestamp) {
 				//fmt.Printf("rowImage: %v, updatedTimestamp: %f\n", rowImage, updatedTimestamp)
+				// This only for duplicateCount metric, the extra lookup should not incur too much performance penality
 				if _, ok := msgBatch[string(message.Key)]; ok {
 					duplicateCount++
 				}
@@ -600,7 +603,7 @@ func processBatch(ctx context.Context, partition int32, conns map[string]*pgxpoo
 	// dataUpsert holds all the afterImage of the rows to be inserted/updated
 	var dataUpsert = make(map[string]map[string]interface{})
 	upsertQueryCount, deleteQueryCount := 0, 0
-	fmt.Printf("DEBUG processBatch(), partition: %v, len(data): %v\n", partition, len(data))
+	//fmt.Printf("DEBUG processBatch(), partition: %v, len(data): %v\n", partition, len(data))
 	// REMOVE this: one-time debug code, check any duplicates of the column `id`
 	//for msgKey, msgData := range data {
 	//	for msgType, rowImageMap := range msgData {
@@ -945,39 +948,90 @@ func dbExecuteUpsertDelete(ctx context.Context, conn *pgxpool.Pool, sqlStmt stri
 // TODO(gli):  make it rebalance in case of  node failure(s)/drain/decommission and/or cluster expansion/shrinking,  or based on the load(cpu)/latency, redistribute/rebalance the database connections.
 func GetDBConnectionPoolBalance(ctx context.Context, conn clisqlclient.Conn, topicPartitions []int32, filterLocality string) (map[int32]map[string]*pgxpool.Pool, error) {
 	var dbConnPools = make(map[int32]map[string]*pgxpool.Pool)
+	var advertiseAddresses []string
+	// double-quote database_name for the mix-case scenario
+	nodeAdvertiseAddressQuery := fmt.Sprintf("SELECT node_id, advertise_address from crdb_internal.gossip_nodes where is_live=true and locality like '%%%s%%'", filterLocality)
+	_, rows, err := sqlExecCtx.RunQuery(
+		ctx,
+		conn,
+		clisqlclient.MakeQuery(nodeAdvertiseAddressQuery),
+		false, /* showMoreChars */
+	)
+
+	if err != nil {
+		return nil, errors.Wrapf(err, "GetDBConnectionPoolBalance(), error executing query: %s", nodeAdvertiseAddressQuery)
+	}
+
+	for _, advertiseAddress := range rows {
+		advertiseAddresses = append(advertiseAddresses, advertiseAddress[1])
+	}
+	totalAdvertiseAddresses := len(advertiseAddresses)
+
+	//fmt.Printf("advertiseAddresses: %v, totalAdvertiseAddresses: %v\n", advertiseAddresses, totalAdvertiseAddresses)
+	// get URL from the cockroach CLI
+	pgOriginalURL := conn.GetURL()
+	re := regexp.MustCompile("(postgresql://.*@)(.*:.*?)(/.*)")
+	// round-robin (using modulus) assign the node to the partition with upsert/delete.
+	for i, partition := range topicPartitions {
+		partitionURL := re.ReplaceAllString(pgOriginalURL, fmt.Sprintf("${1}%s${3}", advertiseAddresses[i%totalAdvertiseAddresses]))
+		//fmt.Printf("advertiseAddresses[i%%totalAdvertiseAddresses]: %v, partitionURL: %v, pgOriginalURL: %v\n", advertiseAddresses[i%totalAdvertiseAddresses], partitionURL, pgOriginalURL)
+		dbConnPoolByType, err := GetDBConnByTypesByURL(ctx, partitionURL)
+		if err != nil {
+			// clean up existing db connections if any
+			cleanupDBConnPools(dbConnPools)
+			return nil, errors.Wrapf(err, "GetDBConnectionPoolBalance() error making db connection for partition %v:", partition)
+		}
+		dbConnPools[partition] = dbConnPoolByType
+	}
 
 	return dbConnPools, nil
 }
 
-// GetDBConnectionPool returns the database connection pools for each partition, which has 2, one for upsert, one for delete
+// GetDBConnectionPoolSingleNode returns the database connection pools for each partition, which has 2, one for upsert, one for delete
 // Unlike the GetDBConnectionPoolBalance which tries to distribute the load across more gateway nodes in the cluster,
 // this function gets the connection to the same host from cockroach CLI.
 // There are use cases, where multiple cockroach recoverfromcdc commands are started in parallel on the same hosts or multiple hosts for specific partitions.
 // In that case, each process can pin to certain gateway node for the partition list.  The balance is done externally.
-func GetDBConnectionPool(ctx context.Context, conn clisqlclient.Conn, topicPartitions []int32) (map[int32]map[string]*pgxpool.Pool, error) {
+func GetDBConnectionPoolSingleNode(ctx context.Context, conn clisqlclient.Conn, topicPartitions []int32) (map[int32]map[string]*pgxpool.Pool, error) {
 	var dbConnPools = make(map[int32]map[string]*pgxpool.Pool)
-	var dbConnTypes = []string{CDCMessageTypeUpsert, CDCMessageTypeDelete}
 	// get the same URL as the cockroach CLI
 	pgURL := conn.GetURL()
 	for _, partition := range topicPartitions {
 		var dbConnPoolByType = make(map[string]*pgxpool.Pool)
-		fmt.Printf("partition: %v, pgURL: %v\n", partition, pgURL)
-		for _, dbConnType := range dbConnTypes {
-			dbConn, err := GetDBConnByURL(ctx, pgURL)
-			if err != nil {
-				// clean up existing db connections if any
-				for _, dbConnByTypes := range dbConnPools {
-					for _, dbConnByType := range dbConnByTypes {
-						dbConnByType.Close()
-					}
-				}
-				return nil, errors.Wrapf(err, "GetDBConnectionPool() error making db connection for partition %v:", partition)
-			}
-			dbConnPoolByType[dbConnType] = dbConn
+		fmt.Printf("GetDBConnectionPoolSingleNode() partition: %v, pgURL: %v\n", partition, pgURL)
+		dbConnPoolByType, err := GetDBConnByTypesByURL(ctx, pgURL)
+		if err != nil {
+			// clean up existing db connections if any
+			cleanupDBConnPools(dbConnPools)
+			return nil, errors.Wrapf(err, "GetDBConnectionPoolSingleNode() error making db connection for partition %v:", partition)
 		}
 		dbConnPools[partition] = dbConnPoolByType
 	}
 	return dbConnPools, nil
+}
+
+// GetDBConnByTypesByURL returns the *pgxpool.Pool from the pgURL for both upsert & delete
+func GetDBConnByTypesByURL(ctx context.Context, pgURL string) (map[string]*pgxpool.Pool, error) {
+	var dbConnPoolByType = make(map[string]*pgxpool.Pool)
+	var dbConnTypes = []string{CDCMessageTypeUpsert, CDCMessageTypeDelete}
+	for _, dbConnType := range dbConnTypes {
+		dbConn, err := GetDBConnByURL(ctx, pgURL)
+		if err != nil {
+			return nil, errors.Wrapf(err, "GetDBConnByTypesByURL() error making db connection for pgURL %v:", pgURL)
+		}
+		dbConnPoolByType[dbConnType] = dbConn
+	}
+	return dbConnPoolByType, nil
+}
+
+// cleanupDBConnPools closes the DB connection pools
+func cleanupDBConnPools(dbConnPools map[int32]map[string]*pgxpool.Pool) {
+	fmt.Printf("cleaning up dbConnPools: %v\n", dbConnPools)
+	for _, dbConnByTypes := range dbConnPools {
+		for _, dbConnByType := range dbConnByTypes {
+			dbConnByType.Close()
+		}
+	}
 }
 
 // GetDBConnByURL returns the *pgxpool.Pool from the pgURL
@@ -1009,4 +1063,21 @@ func GetDBConnByURL(ctx context.Context, pgURL string) (*pgxpool.Pool, error) {
 	}
 
 	return pool, dbConnErr
+}
+
+func GetDBConnectionPool(ctx context.Context, conn clisqlclient.Conn, topicPartitions []int32, useBalanceConnection bool, filterLocality string) (map[int32]map[string]*pgxpool.Pool, error) {
+	var dbConnPools = make(map[int32]map[string]*pgxpool.Pool)
+	var dbErr error
+	if useBalanceConnection {
+		dbConnPools, dbErr = GetDBConnectionPoolBalance(ctx, conn, topicPartitions, filterLocality)
+		if dbErr != nil {
+			return nil, errors.Wrapf(dbErr, "Failed to get dbConnPools (Balance) for topicPartitions: %v\n", topicPartitions)
+		}
+		return dbConnPools, nil
+	}
+	dbConnPools, dbErr = GetDBConnectionPoolSingleNode(ctx, conn, topicPartitions)
+	if dbErr != nil {
+		return nil, errors.Wrapf(dbErr, "Failed to get dbConnPools (SingleNode) for topicPartitions: %v\n", topicPartitions)
+	}
+	return dbConnPools, nil
 }
