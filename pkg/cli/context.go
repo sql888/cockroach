@@ -740,6 +740,10 @@ var recoverfromcdcCtx struct {
 	RecoverEndTimestamp                         string // format YYYY-MM-DDTHH24:MI:SS.999999999Z UTC time, default is empty
 	RecoverKafkaEndOffset                       int64  // default is 0
 	RecoverKafkaCommandConfigFile               string
+	RecoverKafkaFanOutEnable                    bool // default is false
+	RecoverKafkaFanOutTargetBootstrapServer     string
+	RecoverKafkaFanOutTargetTopicName           string
+	RecoverKafkaFanOutTargetCommandConfigFile   string
 	RecoverBatchSize                            int    // default is 100
 	RecoverUseBalanceDBConnection               bool   // default is false
 	RecoverUseBalanceDBConnectionLocalityFilter string // default is empty
@@ -765,6 +769,10 @@ func setRecoverFromCDCContextDefaults() {
 	recoverfromcdcCtx.RecoverEndTimestamp = EmptyString
 	recoverfromcdcCtx.RecoverKafkaEndOffset = KafkaStartOffsetDefault // use the same default as start offset, meaning no end offset specified.
 	recoverfromcdcCtx.RecoverKafkaCommandConfigFile = EmptyString
+	recoverfromcdcCtx.RecoverKafkaFanOutEnable = false
+	recoverfromcdcCtx.RecoverKafkaFanOutTargetBootstrapServer = EmptyString
+	recoverfromcdcCtx.RecoverKafkaFanOutTargetTopicName = EmptyString
+	recoverfromcdcCtx.RecoverKafkaFanOutTargetCommandConfigFile = EmptyString
 	recoverfromcdcCtx.RecoverBatchSize = RecoverBatchSizeDefault
 	recoverfromcdcCtx.RecoverUseBalanceDBConnection = false
 	recoverfromcdcCtx.RecoverUseBalanceDBConnectionLocalityFilter = EmptyString

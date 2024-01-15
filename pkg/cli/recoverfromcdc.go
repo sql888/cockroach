@@ -29,7 +29,6 @@ import (
 	"time"
 
 	"github.com/Shopify/sarama"
-	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
 	"github.com/cockroachdb/cockroach/pkg/cli/clisqlclient"
 	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -93,60 +92,28 @@ const (
 	// DBConnectionMaxRetrySleepSeconds is the maximum number of seconds to sleep between retries
 	DBConnectionMaxRetrySleepSeconds = 60
 	// ReportSectionDivider is the section divider for pretty printing
-	ReportSectionDivider            = "============================================================================================================="
-	SinkParamCACert                 = `ca_cert`
-	SinkParamClientCert             = `client_cert`
-	SinkParamClientKey              = `client_key`
-	SinkParamFileSize               = `file_size`
-	SinkParamPartitionFormat        = `partition_format`
-	SinkParamSchemaTopic            = `schema_topic`
-	SinkParamTLSEnabled             = `tls_enabled`
-	SinkParamSkipTLSVerify          = `insecure_tls_skip_verify`
-	SinkParamTopicPrefix            = `topic_prefix`
-	SinkParamTopicName              = `topic_name`
-	SinkSchemeCloudStorageAzure     = `azure`
-	SinkSchemeCloudStorageGCS       = `gs`
-	SinkSchemeCloudStorageHTTP      = `http`
-	SinkSchemeCloudStorageHTTPS     = `https`
-	SinkSchemeCloudStorageNodelocal = `nodelocal`
-	SinkSchemeCloudStorageS3        = `s3`
-	SinkSchemeExperimentalSQL       = `experimental-sql`
-	SinkSchemeHTTP                  = `http`
-	SinkSchemeHTTPS                 = `https`
-	SinkSchemeKafka                 = `kafka`
-	SinkSchemeNull                  = `null`
-	SinkSchemeWebhookHTTP           = `webhook-http`
-	SinkSchemeWebhookHTTPS          = `webhook-https`
-	SinkSchemeExternalConnection    = `external`
-	SinkParamSASLEnabled            = `sasl_enabled`
-	SinkParamSASLHandshake          = `sasl_handshake`
-	SinkParamSASLUser               = `sasl_user`
-	SinkParamSASLPassword           = `sasl_password`
-	SinkParamSASLMechanism          = `sasl_mechanism`
-	SinkParamSASLClientID           = `sasl_client_id`
-	SinkParamSASLClientSecret       = `sasl_client_secret`
-	SinkParamSASLTokenURL           = `sasl_token_url`
-	SinkParamSASLScopes             = `sasl_scopes`
-	SinkParamSASLGrantType          = `sasl_grant_type`
+	ReportSectionDivider = "============================================================================================================="
+	// KafkaParamBootstrapServers is the property bootstrap.servers in the property file. this can be overridden by the CLI
+	KafkaParamBootstrapServers = `bootstrap.servers`
+	// KafkaParamTopicName is the property topic.name in the property file. this can be overridden by the CLI
+	KafkaParamTopicName = `topic.name`
+	// KafkaParamSASLMechanism is the property name for sasl.mechanism. e.g. PLAIN, GSSAPI
+	KafkaParamSASLMechanism = `sasl.mechanism`
+	// KafkaParamSecurityProtocol is the property name for security.protocol. e.g. SASL_SSL, SASL_PLAINTEXT, PLAINTEXT
+	KafkaParamSecurityProtocol = `security.protocol`
+	// KafkaParamClientID is the client id of the producer/consumer,  if this is not specified in the property file, it will be generated using CockroachDBRecoverFromCDC-<KafkaTopicName>
+	KafkaParamClientID = `client.id`
+	// KafkaParamSASLJAASConfig is the sasl.jaas.config in the property file, it has the username, password.
+	KafkaParamSASLJAASConfig = `sasl.jaas.config`
+	// KafkaParamSSLTrustStoreType is ssl.truststore.type, e.g. PEM
+	KafkaParamSSLTrustStoreType = `ssl.truststore.type`
+	// KafkaParamSSLTrustStoreLocation is the file location of the RootCA.
+	KafkaParamSSLTrustStoreLocation = `ssl.truststore.location`
+	// KafkaClientTypeConsumer is the kafka client type Consumer
+	KafkaClientTypeConsumer = `Consumer`
+	// KafkaClientTypeProducer is the kafka client type Producer
+	KafkaClientTypeProducer = `Producer`
 )
-
-type kafkaDialConfig struct {
-	tlsEnabled       bool
-	tlsSkipVerify    bool
-	caCert           []byte
-	clientCert       []byte
-	clientKey        []byte
-	saslEnabled      bool
-	saslHandshake    bool
-	saslUser         string
-	saslPassword     string
-	saslMechanism    string
-	saslTokenURL     string
-	saslClientID     string
-	saslClientSecret string
-	saslScopes       []string
-	saslGrantType    string
-}
 
 // runRecoverFromCDC implements to logic to recover the db.table using CDC, only Kafka sink is supported as of now.
 func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
@@ -159,13 +126,14 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 		return errors.Errorf("RecoverCockroachTableName: %v is empty", recoverfromcdcCtx.RecoverCockroachTableName)
 	}
 
-	if len(recoverfromcdcCtx.RecoverKafkaBootstrapServer) == 0 {
-		return errors.Errorf("RecoverKafkaBootstrapServer: %v is empty", recoverfromcdcCtx.RecoverKafkaBootstrapServer)
-	}
+	// RecoverKafkaBootstrapServer & RecoverKafkaTopicName can be from the property file if not specified via the CLI
+	//if len(recoverfromcdcCtx.RecoverKafkaBootstrapServer) == 0 {
+	//	return errors.Errorf("RecoverKafkaBootstrapServer: %v is empty", recoverfromcdcCtx.RecoverKafkaBootstrapServer)
+	//}
 
-	if len(recoverfromcdcCtx.RecoverKafkaTopicName) == 0 {
-		return errors.Errorf("RecoverKafkaTopicName: %v is empty", recoverfromcdcCtx.RecoverKafkaTopicName)
-	}
+	//if len(recoverfromcdcCtx.RecoverKafkaTopicName) == 0 {
+	//	return errors.Errorf("RecoverKafkaTopicName: %v is empty", recoverfromcdcCtx.RecoverKafkaTopicName)
+	//}
 
 	// convert the UTC timestamp to Unix epoch nanoseconds as float64
 	recoverStartTime, err := time.Parse(time.RFC3339Nano, recoverfromcdcCtx.RecoverStartTimestamp)
@@ -207,111 +175,23 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 	}
 	fmt.Printf("pkColumns: %v\n", pkColumns)
 
-	dialConfig := kafkaDialConfig{}
-	if len(recoverfromcdcCtx.RecoverKafkaCommandConfigFile) > 0 {
-		if _, err := os.Stat(recoverfromcdcCtx.RecoverKafkaCommandConfigFile); errors.Is(err, os.ErrNotExist) {
-			return errors.Errorf("RecoverKafkaCommandConfigFile: %v does not exist.", recoverfromcdcCtx.RecoverKafkaCommandConfigFile)
-		}
-		// Read the properties file
-		props := properties.MustLoadFile(recoverfromcdcCtx.RecoverKafkaCommandConfigFile, properties.UTF8).Map()
-		fmt.Printf("props: %v\n", props)
-		// check if Kafka Auth is provided.
-		// TODO: move this to another package/file/function.  This only handles a subset of cases. complete logic is in "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/sink_kafka.go"
-		if saslMechanism, ok := props["sasl.mechanism"]; ok {
-			dialConfig.saslEnabled = true
-			// Auth is provided, always set tlsSkipVerify for now
-			dialConfig.tlsSkipVerify = true
-			dialConfig.tlsEnabled = false
-			if securityProtocol, ok := props["security.protocol"]; ok && securityProtocol == "SASL_SSL" {
-				dialConfig.tlsEnabled = true
-			}
-			if saslMechanism == "PLAIN" {
-				dialConfig.saslMechanism = sarama.SASLTypePlaintext
-			}
-			if saslJaasConfig, ok := props["sasl.jaas.config"]; ok {
-				fmt.Printf("saslJaasConfig: %v\n", saslJaasConfig)
-				re := regexp.MustCompile(`username=\s*"([^"]*)"\s+password=\s*"\s*([^"]*)"`)
-				credential := re.FindAllStringSubmatch(saslJaasConfig, -1)
-				fmt.Printf("credential[0][1]: %v, credential[0][2]:%v\n", credential[0][1], credential[0][2])
-				dialConfig.saslUser = credential[0][1]
-				dialConfig.saslPassword = credential[0][2]
-			} else {
-				return errors.Errorf("RecoverKafkaCommandConfigFile: %v missing sasl.jaas.config", recoverfromcdcCtx.RecoverKafkaCommandConfigFile)
-			}
-		}
-		// TODO: parse other consumer configs, and set in the Sarama config.
-	}
-	saramaConfig := sarama.NewConfig()
-	saramaConfig.ClientID = fmt.Sprintf("CockroachDBRecoverFromCDC-%v", recoverfromcdcCtx.RecoverKafkaTopicName)
-	if dialConfig.tlsEnabled {
-		saramaConfig.Net.TLS.Enable = true
-		saramaConfig.Net.TLS.Config = &tls.Config{
-			InsecureSkipVerify: dialConfig.tlsSkipVerify,
-		}
-		if dialConfig.caCert != nil {
-			caCertPool := x509.NewCertPool()
-			caCertPool.AppendCertsFromPEM(dialConfig.caCert)
-			saramaConfig.Net.TLS.Config.RootCAs = caCertPool
-		}
-
-		if dialConfig.clientCert != nil && dialConfig.clientKey == nil {
-			return errors.Errorf(`%s requires %s to be set`, changefeedbase.SinkParamClientCert, changefeedbase.SinkParamClientKey)
-		} else if dialConfig.clientKey != nil && dialConfig.clientCert == nil {
-			return errors.Errorf(`%s requires %s to be set`, changefeedbase.SinkParamClientKey, changefeedbase.SinkParamClientCert)
-		}
-
-		if dialConfig.clientCert != nil && dialConfig.clientKey != nil {
-			cert, err := tls.X509KeyPair(dialConfig.clientCert, dialConfig.clientKey)
-			if err != nil {
-				return errors.Wrap(err, `invalid client certificate data provided`)
-			}
-			saramaConfig.Net.TLS.Config.Certificates = []tls.Certificate{cert}
-		}
-	} else {
-		if dialConfig.caCert != nil {
-			return errors.Errorf(`%s requires %s=true`, changefeedbase.SinkParamCACert, changefeedbase.SinkParamTLSEnabled)
-		}
-		if dialConfig.clientCert != nil {
-			return errors.Errorf(`%s requires %s=true`, changefeedbase.SinkParamClientCert, changefeedbase.SinkParamTLSEnabled)
-		}
+	saramaConfig, kafkaBootstrapServers, kafkaTopicName, err := NewSaramaConfig(recoverfromcdcCtx.RecoverKafkaCommandConfigFile, recoverfromcdcCtx.RecoverKafkaBootstrapServer, recoverfromcdcCtx.RecoverKafkaTopicName, KafkaClientTypeConsumer)
+	if err != nil {
+		return errors.Wrapf(err, "Error from NewSaramaConfig: %v", recoverfromcdcCtx.RecoverKafkaCommandConfigFile)
 	}
 
-	if dialConfig.saslEnabled {
-		saramaConfig.Net.SASL.Enable = true
-		saramaConfig.Net.SASL.Handshake = true
-		saramaConfig.Net.SASL.User = dialConfig.saslUser
-		saramaConfig.Net.SASL.Password = dialConfig.saslPassword
-		saramaConfig.Net.SASL.Mechanism = sarama.SASLMechanism(dialConfig.saslMechanism)
-		// switch saramaConfig.Net.SASL.Mechanism
-		// TODO: handle sarama.SASLTypeSCRAMSHA512, sarama.SASLTypeSCRAMSHA256, sarama.SASLTypeOAuth
-	}
-	// TODO: AutoCommit needs to be set to false to prevent data loss in case the upsert/delete fails.
-	saramaConfig.Consumer.Offsets.AutoCommit.Enable = true
-	//saramaConfig.Consumer.Fetch.Min = 1
-	//saramaConfig.Consumer.Fetch.Default = ConsumerMaxMessageBytes
-	// consume from the oldest.  unless the offset is specified in CLI to resume from previous interrupted recovery
-	saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
-	saramaConfig.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.BalanceStrategySticky}
-	saramaConfig.Consumer.Return.Errors = true
-	// increase when seeing "abandoned subscription to...because consuming was taking too long" or check slow writing to destination
-	saramaConfig.Consumer.MaxProcessingTime = 1000 * time.Millisecond
-	// Increase Retry in case of client/metadata got error from broker <broker.id> while fetching metadata: EOF
-	saramaConfig.Metadata.Retry.Max = 100000
-	// The sarama.V2_1_0_0 can support zstd compression
-	saramaConfig.Version = sarama.V2_1_0_0
-
-	sarama.Logger = log.New(os.Stdout, "sarama: ", log.Lshortfile)
+	sarama.Logger = log.New(os.Stdout, "sarama: ", log.Llongfile)
 
 	fmt.Printf("saramaConfig: %v\n", saramaConfig)
 	fmt.Printf("saramaConfig.Net.SASL.Enable: %v\n", saramaConfig.Net.SASL.Enable)
-	kafkaClient, err := sarama.NewConsumer(strings.Split(recoverfromcdcCtx.RecoverKafkaBootstrapServer, ","), saramaConfig)
+	kafkaClient, err := sarama.NewConsumer(strings.Split(kafkaBootstrapServers, ","), saramaConfig)
 	if err != nil {
-		return errors.Wrapf(err, "Error creating a new consumer: %v", recoverfromcdcCtx.RecoverKafkaBootstrapServer)
+		return errors.Wrapf(err, "Error creating a new consumer: %v", kafkaBootstrapServers)
 	}
 
 	topicPartitions, err := getPartitions(kafkaClient)
 	if err != nil {
-		return errors.Wrapf(err, "Error getting partitions from kafka cluster: %v, topic: %v", recoverfromcdcCtx.RecoverKafkaBootstrapServer, recoverfromcdcCtx.RecoverKafkaTopicName)
+		return errors.Wrapf(err, "Error getting partitions from kafka cluster: %v, topic: %v", kafkaBootstrapServers, kafkaTopicName)
 	}
 
 	dbConnPools, err := GetDBConnectionPool(ctx, conn, topicPartitions, recoverfromcdcCtx.RecoverUseBalanceDBConnection, recoverfromcdcCtx.RecoverUseBalanceDBConnectionLocalityFilter)
@@ -346,7 +226,7 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 		if recoverfromcdcCtx.RecoverKafkaStartOffset > KafkaStartOffsetDefault {
 			partitionStartOffset = recoverfromcdcCtx.RecoverKafkaStartOffset
 		}
-		pc, err := kafkaClient.ConsumePartition(recoverfromcdcCtx.RecoverKafkaTopicName, partition, partitionStartOffset)
+		pc, err := kafkaClient.ConsumePartition(kafkaTopicName, partition, partitionStartOffset)
 		if err != nil {
 			return errors.Wrapf(err, "Failed to start consumer for partition %d", partition)
 		}
@@ -368,7 +248,7 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 	if err := pcGroup.Wait(); err != nil {
 		fmt.Printf("pcGroup encourters an error: %v\n", err)
 	}
-	fmt.Println("Done consuming topic", recoverfromcdcCtx.RecoverKafkaTopicName)
+	fmt.Println("Done consuming topic", kafkaTopicName)
 	close(messages)
 
 	if err := kafkaClient.Close(); err != nil {
@@ -968,6 +848,8 @@ func GetDBConnectionPoolBalance(ctx context.Context, conn clisqlclient.Conn, top
 	totalAdvertiseAddresses := len(advertiseAddresses)
 
 	//fmt.Printf("advertiseAddresses: %v, totalAdvertiseAddresses: %v\n", advertiseAddresses, totalAdvertiseAddresses)
+	// Use the list of advertise addresses to form the pgURL with all the input from the CLI
+	// The below is a shortcut/hack to replace the CLI pgURL <host>:<port> with the advertise_address
 	// get URL from the cockroach CLI
 	pgOriginalURL := conn.GetURL()
 	re := regexp.MustCompile("(postgresql://.*@)(.*:.*?)(/.*)")
@@ -1065,6 +947,8 @@ func GetDBConnByURL(ctx context.Context, pgURL string) (*pgxpool.Pool, error) {
 	return pool, dbConnErr
 }
 
+// GetDBConnectionPool returns the database connection pools. if balance is not specified, use the node from the CLI
+// otherwise, round-robin assign the live nodes in the cluster to the kafka topic partition.
 func GetDBConnectionPool(ctx context.Context, conn clisqlclient.Conn, topicPartitions []int32, useBalanceConnection bool, filterLocality string) (map[int32]map[string]*pgxpool.Pool, error) {
 	var dbConnPools = make(map[int32]map[string]*pgxpool.Pool)
 	var dbErr error
@@ -1080,4 +964,112 @@ func GetDBConnectionPool(ctx context.Context, conn clisqlclient.Conn, topicParti
 		return nil, errors.Wrapf(dbErr, "Failed to get dbConnPools (SingleNode) for topicPartitions: %v\n", topicPartitions)
 	}
 	return dbConnPools, nil
+}
+
+// NewSaramaConfig returns the sarama config, the clientType is either Consumer or Producer.
+func NewSaramaConfig(kafkaConsumerProducerConfigFile string, kafkaBootstrapServer string, kafkaTopicName string, clientType string) (*sarama.Config, string, string, error) {
+	outKafkaBootstrapServer := kafkaBootstrapServer
+	outKafkaTopicName := kafkaTopicName
+	saramaConfig := sarama.NewConfig()
+	if len(kafkaConsumerProducerConfigFile) > 0 {
+		if _, err := os.Stat(kafkaConsumerProducerConfigFile); errors.Is(err, os.ErrNotExist) {
+			return nil, kafkaBootstrapServer, kafkaTopicName, errors.Errorf("RecoverKafkaCommandConfigFile: %v does not exist.", kafkaConsumerProducerConfigFile)
+		}
+		// Read the properties file
+		props := properties.MustLoadFile(kafkaConsumerProducerConfigFile, properties.UTF8).Map()
+		// fmt.Printf("props: %v\n", props)
+		// check if Kafka Auth is provided.
+		// TODO: move this to another package/file/function.  This only handles a subset of cases. complete logic is in "github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/sink_kafka.go"
+		if saslMechanism, ok := props[KafkaParamSASLMechanism]; ok {
+			saramaConfig.Net.SASL.Enable = true
+			saramaConfig.Net.SASL.Handshake = true
+			saramaConfig.Net.SASL.Mechanism = sarama.SASLMechanism(saslMechanism)
+			// switch saramaConfig.Net.SASL.Mechanism
+			// TODO: handle sarama.SASLTypeSCRAMSHA512, sarama.SASLTypeSCRAMSHA256, sarama.SASLTypeOAuth
+
+			if securityProtocol, ok := props[KafkaParamSecurityProtocol]; ok && securityProtocol == "SASL_SSL" {
+				saramaConfig.Net.TLS.Enable = true
+				// Auth is provided, always set tlsSkipVerify to true for now
+				saramaConfig.Net.TLS.Config = &tls.Config{
+					InsecureSkipVerify: true,
+				}
+			}
+
+			if saslJaasConfig, ok := props[KafkaParamSASLJAASConfig]; ok {
+				// fmt.Printf("saslJaasConfig: %v\n", saslJaasConfig)
+				re := regexp.MustCompile(`username=\s*"([^"]*)"\s+password=\s*"\s*([^"]*)"`)
+				credential := re.FindAllStringSubmatch(saslJaasConfig, -1)
+				// fmt.Printf("credential[0][1]: %v, credential[0][2]:%v\n", credential[0][1], credential[0][2])
+				saramaConfig.Net.SASL.User = credential[0][1]
+				saramaConfig.Net.SASL.Password = credential[0][2]
+			} else {
+				return nil, kafkaBootstrapServer, kafkaTopicName, errors.Errorf("RecoverKafkaCommandConfigFile: %v missing sasl.jaas.config", kafkaConsumerProducerConfigFile)
+			}
+
+			// Only handle the ssl.truststore.type=PEM for now
+			if sslTrustStoreType, ok := props[KafkaParamSSLTrustStoreType]; ok && sslTrustStoreType == "PEM" {
+				if sslTrustStoreLocation, ok := props[KafkaParamSSLTrustStoreLocation]; ok && len(sslTrustStoreLocation) > 0 {
+					fileContent, err := os.ReadFile(sslTrustStoreLocation)
+					if err != nil {
+						return nil, kafkaBootstrapServer, kafkaTopicName, errors.Wrapf(err, "error reading from ssl.truststore.location: %v.", sslTrustStoreLocation)
+					}
+					caCertPool := x509.NewCertPool()
+					caCertPool.AppendCertsFromPEM(fileContent)
+					saramaConfig.Net.TLS.Config.RootCAs = caCertPool
+				}
+			}
+
+		}
+
+		// clientID in the command-config consumer/producer properties file override the default
+		saramaConfig.ClientID = fmt.Sprintf("CockroachDBRecoverFromCDC-%v-%v", clientType, kafkaTopicName)
+		if clientID, ok := props[KafkaParamClientID]; ok && len(clientID) > 0 {
+			saramaConfig.ClientID = clientID
+		}
+
+		if len(outKafkaBootstrapServer) == 0 {
+			if bootstrapServers, ok := props[KafkaParamBootstrapServers]; ok && len(bootstrapServers) > 0 {
+				outKafkaBootstrapServer = bootstrapServers
+			} else {
+				return nil, kafkaBootstrapServer, kafkaTopicName, errors.Errorf("bootstrap.servers needs to be specified in the property file or CLI.")
+			}
+		}
+
+		if len(outKafkaTopicName) == 0 {
+			if topicName, ok := props[KafkaParamTopicName]; ok && len(topicName) > 0 {
+				outKafkaTopicName = topicName
+			} else {
+				return nil, kafkaBootstrapServer, kafkaTopicName, errors.Errorf("topic.name needs to be specified in the property file or CLI.")
+			}
+		}
+
+		// TODO: parse other consumer/producer configs, and set in the Sarama config.
+	}
+
+	// TODO: AutoCommit needs to be set to false to prevent data loss in case the upsert/delete fails.
+	if clientType == KafkaClientTypeConsumer {
+		saramaConfig.Consumer.Offsets.AutoCommit.Enable = true
+		//saramaConfig.Consumer.Fetch.Min = 1
+		//saramaConfig.Consumer.Fetch.Default = ConsumerMaxMessageBytes
+		// consume from the oldest.  unless the offset is specified in CLI to resume from previous interrupted recovery
+		saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
+		saramaConfig.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.BalanceStrategySticky}
+		saramaConfig.Consumer.Return.Errors = true
+		// increase when seeing "abandoned subscription to...because consuming was taking too long" or check slow writing to destination
+		saramaConfig.Consumer.MaxProcessingTime = 1000 * time.Millisecond
+	}
+
+	if clientType == KafkaClientTypeProducer {
+		// WaitForLocal RequiredAcks = 1 should be good enough with much higher throughput, unless there are broker failures in the kafka cluster.
+		// TODO(gli): get this setting from the producer property file. AtLeastOnce delivery:  WaitForAll RequiredAcks = -1, The fire-and-forget should not be used:  NoResponse RequiredAcks = 0
+		saramaConfig.Producer.RequiredAcks = sarama.WaitForLocal
+		saramaConfig.Producer.Retry.Max = 100000
+	}
+
+	// Increase Retry in case of client/metadata got error from broker <broker.id> while fetching metadata: EOF
+	saramaConfig.Metadata.Retry.Max = 100000
+	// The sarama.V2_1_0_0 can support zstd compression
+	saramaConfig.Version = sarama.V2_1_0_0
+
+	return saramaConfig, outKafkaBootstrapServer, outKafkaTopicName, nil
 }

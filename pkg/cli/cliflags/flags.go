@@ -1974,16 +1974,48 @@ The cockroach table name to recover.`,
 The Kafka bootstrap server URL. <dns_host_ip>:<port>`,
 	}
 
+	RecoverKafkaFanOutTargetBootstrapServer = FlagInfo{
+		Name: "recover-kafka-fan-out-target-bootstrap-server",
+		Description: `
+The Kafka bootstrap server URL. <dns_host_ip>:<port> for the fan out target Kafka cluster. 
+This can be different from the original topic's kafka cluster.'`,
+	}
+
 	RecoverKafkaCommandConfigFile = FlagInfo{
 		Name: "recover-kafka-command-config",
 		Description: `
 The optional kafka config file which can provide authentication, consumer configs, etc.`,
 	}
 
+	RecoverKafkaFanOutEnable = FlagInfo{
+		Name: "recover-kafka-fan-out-enable",
+		Description: `
+When this is specified, the cockroach recoverfromcdc will be running in a different mode as 
+a Kafka consumer reading from the partitions and preserve the message key to produce to a another
+topic (in the same cluster or different cluster). The use cases is to create a high fan out pipe. 
+Another running instances can consume from the new topic with higher number of partitions and thus
+possibly increase the throughput ingestion to the DB. Because the same message key, which is the
+primary key columns, the fan out topic can preserve the ordering`,
+	}
+
+	RecoverKafkaFanOutTargetCommandConfigFile = FlagInfo{
+		Name: "recover-kafka-fan-out-target-command-config",
+		Description: `
+The optional kafka config file which can provide authentication, producer configs, etc. 
+
+This is required when --recover-kafka-fan-out-enable is specified. e.g. provide the bootstrap.servers, topic name, etc.`,
+	}
+
+	RecoverKafkaFanOutTargetTopicName = FlagInfo{
+		Name: "recover-kafka-fan-out-target-topic-name",
+		Description: `
+The fan out target Kafka topic with more partitions to scale up the ingestion with more concurrent parallelism.`,
+	}
+
 	RecoverKafkaTopicName = FlagInfo{
 		Name: "recover-kafka-topic-name",
 		Description: `
-The cockroach table name to recover.`,
+The CDC kafka topic name to recover the delta changes.`,
 	}
 
 	RecoverKafkaTopicPartitions = FlagInfo{
