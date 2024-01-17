@@ -51,8 +51,8 @@ const (
 	BatchTimeout = 2000 * time.Millisecond
 	// ReportIntervalSeconds is the number of seconds to report the progress of the recovery  for each partition.
 	ReportIntervalSeconds = 10
-	// ConsumerMaxMessageBytes is the message bytes for the consumer to fetch
-	ConsumerMaxMessageBytes = 33554432
+	// KafkaConsumerMaxMessageBytes is the message bytes for the consumer to fetch
+	KafkaConsumerMaxMessageBytes = 33554432
 	// CDCKeyAfter is the after image of the table row. This can be used to determine what type of the message.  Upsert or Delete
 	CDCKeyAfter = "after"
 	// CDCKeyBefore is the before image of the table row. This can be used to determine what type of the message.  Upsert or Delete
@@ -117,6 +117,9 @@ const (
 
 // runRecoverFromCDC implements to logic to recover the db.table using CDC, only Kafka sink is supported as of now.
 func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
+	var dbConnPools map[int32]map[string]*pgxpool.Pool
+	var saramaProducerConfig *sarama.Config
+	var kafkaProducerBootstrapServers, kafkaProducerTopicName string
 	// Validate the CLI parameters
 	if len(recoverfromcdcCtx.RecoverCockroachDBName) == 0 {
 		return errors.Errorf("RecoverCockroachDBName: %v is empty", recoverfromcdcCtx.RecoverCockroachDBName)
@@ -177,7 +180,7 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 
 	saramaConfig, kafkaBootstrapServers, kafkaTopicName, err := NewSaramaConfig(recoverfromcdcCtx.RecoverKafkaCommandConfigFile, recoverfromcdcCtx.RecoverKafkaBootstrapServer, recoverfromcdcCtx.RecoverKafkaTopicName, KafkaClientTypeConsumer)
 	if err != nil {
-		return errors.Wrapf(err, "Error from NewSaramaConfig: %v", recoverfromcdcCtx.RecoverKafkaCommandConfigFile)
+		return errors.Wrapf(err, "Error from NewSaramaConfig for consumer: %v", recoverfromcdcCtx.RecoverKafkaCommandConfigFile)
 	}
 
 	sarama.Logger = log.New(os.Stdout, "sarama: ", log.Llongfile)
@@ -194,11 +197,24 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 		return errors.Wrapf(err, "Error getting partitions from kafka cluster: %v, topic: %v", kafkaBootstrapServers, kafkaTopicName)
 	}
 
-	dbConnPools, err := GetDBConnectionPool(ctx, conn, topicPartitions, recoverfromcdcCtx.RecoverUseBalanceDBConnection, recoverfromcdcCtx.RecoverUseBalanceDBConnectionLocalityFilter)
-	if err != nil {
-		return errors.Wrapf(err, "Failed to get dbConnPools for topicPartitions: %v\n", topicPartitions)
+	// There are 2 modes of recoverfromcdc.  one for replaying the Kafka topic, one for create a fan out pipe to another Kafka topic with more partitions for higher throughput/parallelism.
+	// when RecoverKafkaFanOutEnable is specified in the command line, it's in the fan-out mode.
+	// There maybe many 3rd-party tools to replicate kafka topic.  However, for convenience as a producer offering and
+	// also to ensure the data ordering is preserve on the original message key, which is the primary key column(s), it's better to provide such tooling.
+	// The high fan out can be used to create benchmark loads with higher concurrency as well, which optionally can turn off de-dup of the original messages.
+	if recoverfromcdcCtx.RecoverKafkaFanOutEnable {
+		saramaProducerConfig, kafkaProducerBootstrapServers, kafkaProducerTopicName, err = NewSaramaConfig(recoverfromcdcCtx.RecoverKafkaFanOutTargetCommandConfigFile, recoverfromcdcCtx.RecoverKafkaFanOutTargetBootstrapServer, recoverfromcdcCtx.RecoverKafkaFanOutTargetTopicName, KafkaClientTypeProducer)
+		if err != nil {
+			return errors.Wrapf(err, "Error from NewSaramaConfig for producer: %v", recoverfromcdcCtx.RecoverKafkaFanOutTargetCommandConfigFile)
+		}
+	} else {
+		// For the replay mode, make the connection pool to the cockroachdb
+		dbConnPools, err = GetDBConnectionPool(ctx, conn, topicPartitions, recoverfromcdcCtx.RecoverUseBalanceDBConnection, recoverfromcdcCtx.RecoverUseBalanceDBConnectionLocalityFilter)
+		if err != nil {
+			return errors.Wrapf(err, "Failed to get dbConnPools for topicPartitions: %v\n", topicPartitions)
+		}
+		defer cleanupDBConnPools(dbConnPools)
 	}
-	defer cleanupDBConnPools(dbConnPools)
 
 	var (
 		messages = make(chan *sarama.ConsumerMessage, recoverfromcdcCtx.RecoverBatchSize)
@@ -239,7 +255,7 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 
 		//go func(pcCtx context.Context, pc sarama.PartitionConsumer, partition int32, batchSize int, conn clisqlclient.Conn, closing chan struct{}) {
 		pcGroup.Go(func() error {
-			err := fetchPartitionConsumer(pcCtx, pc, partition, recoverfromcdcCtx.RecoverBatchSize, dbConnPools[partition], closing, recoverStartTimestampEpochNanoSeconds, pkColumns)
+			err := fetchPartitionConsumer(pcCtx, pc, partition, recoverfromcdcCtx.RecoverBatchSize, dbConnPools[partition], closing, recoverStartTimestampEpochNanoSeconds, pkColumns, saramaProducerConfig, kafkaProducerBootstrapServers, kafkaProducerTopicName, recoverfromcdcCtx.RecoverKafkaFanOutEnable)
 			return err
 		})
 	}
@@ -359,7 +375,9 @@ func getPartitions(c sarama.Consumer) ([]int32, error) {
 }
 
 // fetchPartitionConsumer fetches messages from by partition, by batch and de-dup by the message key
-func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, partition int32, batchSize int, conns map[string]*pgxpool.Pool, closing chan struct{}, recoverStartTimestampEpochNanoSeconds float64, pkColumns []string) error {
+func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, partition int32, batchSize int, conns map[string]*pgxpool.Pool, closing chan struct{}, recoverStartTimestampEpochNanoSeconds float64, pkColumns []string, saramaProducerConfig *sarama.Config, kafkaProducerBootstrapServers, kafkaProducerTopicName string, enableFanOut bool) error {
+	var kafkaProducerClient sarama.SyncProducer
+	var err error
 	var currentOffset, rowsUpserted, rowsDeleted, previousRowsUpserted, previousRowsDeleted, queriesUpserted, queriesDeleted, previousQueriesUpserted, previousQueriesDeleted int64
 	var msgType string
 	var rowImage map[string]interface{}
@@ -367,8 +385,21 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 	rowsUpserted, rowsDeleted, previousRowsUpserted, previousRowsDeleted, queriesUpserted, queriesDeleted, previousQueriesUpserted, previousQueriesDeleted = 0, 0, 0, 0, 0, 0, 0, 0
 	fmt.Printf("consuming pc.Messages() for partition: %v, batchSize: %v\n", partition, batchSize)
 	msgBatch := make(map[string]map[string]map[string]interface{})
+	rawMsgBatch := make(map[string]string)
 	count := 0
 	duplicateCount := 0
+
+	// fan out mode
+	if enableFanOut {
+		// Use SyncProducer by default for replaying, so it won't have data loss. optionally turn on acks=-1 (all) for AtLeastOnce delivery, the performance will be slower. the producer can be parallelized by the # of partitions of the original message. and also via batching.
+		// TODO(gli): for benchmark load test of using a higher fan out kafka topic, it can AsyncProducer
+		kafkaProducerClient, err = sarama.NewSyncProducer(strings.Split(kafkaProducerBootstrapServers, ","), saramaProducerConfig)
+		if err != nil {
+			return errors.Wrapf(err, "Error creating a new producer: %v", kafkaProducerBootstrapServers)
+		}
+		defer func() { err = kafkaProducerClient.Close() }()
+	}
+
 	// set the 1-second timeout for now or the batchSize, which ever is reached first.
 	batchTimeoutTicker := time.NewTicker(BatchTimeout)
 	reportTicker := time.NewTicker(ReportIntervalSeconds * time.Second)
@@ -403,7 +434,7 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 			deleteQueriesPerSecond := int((queriesDeleted - previousQueriesDeleted) / ReportIntervalSeconds)
 			previousQueriesDeleted = queriesDeleted
 
-			fmt.Printf("Report progress every %v seconds. for partition: %v, Current Offset: %v, High Water Mark: %v, Remaining offsets: %v, updatedTimstamp epoch nanoseconds: %f, updateMVCCTime: %v, Time to catchup: %v, Total messages consumed: %v, duplicated: %v, upserted: %v, deleted: %v, throughput(rows/second), upsert: %v, delete : %v, QPS, upsert: %v, delete: %v\n", ReportIntervalSeconds, partition, currentOffset, pc.HighWaterMarkOffset(), pc.HighWaterMarkOffset()-currentOffset, updatedTimestamp, updatedMVCCTime, time.Now().UTC().Sub(updatedMVCCTime), count, duplicateCount, rowsUpserted, rowsDeleted, upsertRowsPerSecond, deleteRowsPerSecond, upsertQueriesPerSecond, deleteQueriesPerSecond)
+			fmt.Printf("%v Report progress every %v seconds. for partition: %v, Current Offset: %v, High Water Mark: %v, Remaining offsets: %v, updatedTimstamp epoch nanoseconds: %f, updateMVCCTime: %v, Time to catchup: %v, Total messages consumed: %v, duplicated: %v, upserted: %v, deleted: %v, throughput(rows/second), upsert: %v, delete : %v, QPS, upsert: %v, delete: %v\n", time.Now().UTC().Format(time.RFC3339), ReportIntervalSeconds, partition, currentOffset, pc.HighWaterMarkOffset(), pc.HighWaterMarkOffset()-currentOffset, updatedTimestamp, updatedMVCCTime, time.Now().UTC().Sub(updatedMVCCTime), count, duplicateCount, rowsUpserted, rowsDeleted, upsertRowsPerSecond, deleteRowsPerSecond, upsertQueriesPerSecond, deleteQueriesPerSecond)
 			//fmt.Printf("Total messages consumed: %v, duplicated: %v, upserted: %v, deleted: %v, throughput(rows/second), upsert: %v, delete : %v, QPS, upsert: %v, delete: %v\n", count, duplicateCount, rowsUpserted, rowsDeleted, upsertRowsPerSecond, deleteRowsPerSecond, upsertQueriesPerSecond, deleteQueriesPerSecond)
 			fmt.Printf("%s\n", ReportSectionDivider)
 		case pcErr := <-pc.Errors():
@@ -440,6 +471,8 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 				}
 				// This will de-dup using the Message.Key. usually this is the PK column(s).
 				msgBatch[string(message.Key)] = map[string]map[string]interface{}{msgType: rowImage}
+				// preserve original message.Value for Fan Out
+				rawMsgBatch[string(message.Key)] = string(message.Value)
 				// the bucket reached the batchSize, set it to
 				if len(msgBatch) == batchSize {
 					sendBatchNow = true
@@ -452,7 +485,7 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 			sendBatchNow = false
 			// if the batch has at least one record.
 			if len(msgBatch) > 0 {
-				batchRowsUpserted, batchRowsDeleted, batchQueriesUpserted, batchQueriesDeleted, err := processBatch(pcCtx, partition, conns, msgBatch, closing, pkColumns)
+				batchRowsUpserted, batchRowsDeleted, batchQueriesUpserted, batchQueriesDeleted, err := processBatch(pcCtx, partition, conns, msgBatch, closing, pkColumns, rawMsgBatch, kafkaProducerClient, kafkaProducerTopicName, enableFanOut)
 				rowsUpserted += int64(batchRowsUpserted)
 				rowsDeleted += int64(batchRowsDeleted)
 				queriesUpserted += int64(batchQueriesUpserted)
@@ -463,6 +496,7 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 				}
 				// make a new map, the old one with no reference should be garbage-collected. Go 1.21 has clear(map)
 				msgBatch = make(map[string]map[string]map[string]interface{})
+				rawMsgBatch = make(map[string]string)
 				// reset the batchTimeoutTicker
 				batchTimeoutTicker.Stop()
 				select {
@@ -477,25 +511,14 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 
 // processBatch processes the data as upsert and delete and submit the query to the DB.
 // It will retry 3 times (to-do to parameterize this) if errors are found.
-func processBatch(ctx context.Context, partition int32, conns map[string]*pgxpool.Pool, data map[string]map[string]map[string]interface{}, closing chan struct{}, pkColumns []string) (int, int, int, int, error) {
+func processBatch(ctx context.Context, partition int32, conns map[string]*pgxpool.Pool, data map[string]map[string]map[string]interface{}, closing chan struct{}, pkColumns []string, rawMsgBatch map[string]string, kafkaProducerClient sarama.SyncProducer, kafkaProducerTopicName string, enableFanOut bool) (int, int, int, int, error) {
 	// dataDelete holds all the delete messages beforeImage to get the list of PK Column(s)
 	var dataDelete = make(map[string]map[string]interface{})
 	// dataUpsert holds all the afterImage of the rows to be inserted/updated
 	var dataUpsert = make(map[string]map[string]interface{})
+	var producerMessages []*sarama.ProducerMessage
 	upsertQueryCount, deleteQueryCount := 0, 0
-	//fmt.Printf("DEBUG processBatch(), partition: %v, len(data): %v\n", partition, len(data))
-	// REMOVE this: one-time debug code, check any duplicates of the column `id`
-	//for msgKey, msgData := range data {
-	//	for msgType, rowImageMap := range msgData {
-	//for rowImageMapKey, rowImageMapValue := range rowImageMap {
-	//	fmt.Printf("rowImageMapKey: %s, rowImageMapValue: %s\n", rowImageMapKey, rowImageMapValue)
-	//}
-	//		idString := fmt.Sprintf("[%s]", rowImageMap["id"].(json.Number))
-	//		if msgType == CDCMessageTypeUpsert && msgKey != idString {
-	//			fmt.Printf("found msgKey: %s not equal to the PK id: %s	\n", msgKey, idString)
-	//		}
-	//	}
-	//}
+
 	// separate the Upsert & Delete Batch, they can be executed in parallel against the CockroachDB, since the ordering in the same partition and de-dup on the same Msg Key -> PK column(s)
 	for msgKey, msgData := range data {
 		for msgType, rowImageMap := range msgData {
@@ -507,6 +530,22 @@ func processBatch(ctx context.Context, partition int32, conns map[string]*pgxpoo
 			dataDelete[msgKey] = rowImageMap
 		}
 	}
+
+	// Fan out mode,  after producing the messages,  short circuit without writing to the cockroachdb
+	if enableFanOut {
+		for msgKey, msgData := range rawMsgBatch {
+			producerMessages = append(producerMessages, &sarama.ProducerMessage{
+				Topic: kafkaProducerTopicName,
+				Key:   sarama.StringEncoder(msgKey),
+				Value: sarama.StringEncoder(msgData),
+			})
+		}
+		if err := kafkaProducerClient.SendMessages(producerMessages); err != nil {
+			return len(dataUpsert), len(dataDelete), upsertQueryCount, deleteQueryCount, errors.Wrapf(err, "error producing messages: %v", producerMessages)
+		}
+		return len(dataUpsert), len(dataDelete), upsertQueryCount, deleteQueryCount, nil
+	}
+
 	// execute the upsert/delete in parallel
 	// TODO:  it's better to have separate database connections for upsert/delete and also utilize all gateway nodes in the cluster optionally filtered by the region/locality
 	dbExecuteGroup, dbExecuteCtx := errgroup.WithContext(ctx)
@@ -989,7 +1028,7 @@ func NewSaramaConfig(kafkaConsumerProducerConfigFile string, kafkaBootstrapServe
 
 			if securityProtocol, ok := props[KafkaParamSecurityProtocol]; ok && securityProtocol == "SASL_SSL" {
 				saramaConfig.Net.TLS.Enable = true
-				// Auth is provided, always set tlsSkipVerify to true for now
+				// TODO(gli): make this configurable in the property file.  Auth is provided, always set tlsSkipVerify to true for now.
 				saramaConfig.Net.TLS.Config = &tls.Config{
 					InsecureSkipVerify: true,
 				}
@@ -1054,7 +1093,7 @@ func NewSaramaConfig(kafkaConsumerProducerConfigFile string, kafkaBootstrapServe
 		// consume from the oldest.  unless the offset is specified in CLI to resume from previous interrupted recovery
 		saramaConfig.Consumer.Offsets.Initial = sarama.OffsetOldest
 		saramaConfig.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.BalanceStrategySticky}
-		saramaConfig.Consumer.Return.Errors = true
+		saramaConfig.Consumer.Return.Errors = false
 		// increase when seeing "abandoned subscription to...because consuming was taking too long" or check slow writing to destination
 		saramaConfig.Consumer.MaxProcessingTime = 1000 * time.Millisecond
 	}
@@ -1064,6 +1103,12 @@ func NewSaramaConfig(kafkaConsumerProducerConfigFile string, kafkaBootstrapServe
 		// TODO(gli): get this setting from the producer property file. AtLeastOnce delivery:  WaitForAll RequiredAcks = -1, The fire-and-forget should not be used:  NoResponse RequiredAcks = 0
 		saramaConfig.Producer.RequiredAcks = sarama.WaitForLocal
 		saramaConfig.Producer.Retry.Max = 100000
+		saramaConfig.Producer.Partitioner = sarama.NewHashPartitioner
+		// The SyncProducer requires this is set to true.  if it's AsyncProducer, set this to false.
+		saramaConfig.Producer.Return.Successes = true
+		saramaConfig.Producer.Flush.Bytes = KafkaConsumerMaxMessageBytes
+		saramaConfig.Producer.Flush.Messages = 10000
+		saramaConfig.Producer.Flush.Frequency = 1000 * time.Millisecond
 	}
 
 	// Increase Retry in case of client/metadata got error from broker <broker.id> while fetching metadata: EOF
