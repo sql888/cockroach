@@ -117,17 +117,11 @@ const (
 
 // runRecoverFromCDC implements to logic to recover the db.table using CDC, only Kafka sink is supported as of now.
 func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
+	var conn clisqlclient.Conn
 	var dbConnPools map[int32]map[string]*pgxpool.Pool
 	var saramaProducerConfig *sarama.Config
 	var kafkaProducerBootstrapServers, kafkaProducerTopicName string
-	// Validate the CLI parameters
-	if len(recoverfromcdcCtx.RecoverCockroachDBName) == 0 {
-		return errors.Errorf("RecoverCockroachDBName: %v is empty", recoverfromcdcCtx.RecoverCockroachDBName)
-	}
-
-	if len(recoverfromcdcCtx.RecoverCockroachTableName) == 0 {
-		return errors.Errorf("RecoverCockroachTableName: %v is empty", recoverfromcdcCtx.RecoverCockroachTableName)
-	}
+	var pkColumns []string
 
 	// RecoverKafkaBootstrapServer & RecoverKafkaTopicName can be from the property file if not specified via the CLI
 	//if len(recoverfromcdcCtx.RecoverKafkaBootstrapServer) == 0 {
@@ -138,45 +132,17 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 	//	return errors.Errorf("RecoverKafkaTopicName: %v is empty", recoverfromcdcCtx.RecoverKafkaTopicName)
 	//}
 
-	// convert the UTC timestamp to Unix epoch nanoseconds as float64
-	recoverStartTime, err := time.Parse(time.RFC3339Nano, recoverfromcdcCtx.RecoverStartTimestamp)
-	if err != nil {
-		return errors.Wrapf(err, "invalid recoverfromcdcCtx.RecoverStartTimestamp: %v", recoverfromcdcCtx.RecoverStartTimestamp)
+	recoverStartTimestampEpochNanoSeconds := 0.0
+	if len(recoverfromcdcCtx.RecoverStartTimestamp) > 0 {
+		// convert the UTC timestamp to Unix epoch nanoseconds as float64
+		recoverStartTime, err := time.Parse(time.RFC3339Nano, recoverfromcdcCtx.RecoverStartTimestamp)
+		if err != nil {
+			return errors.Wrapf(err, "invalid recoverfromcdcCtx.RecoverStartTimestamp: %v", recoverfromcdcCtx.RecoverStartTimestamp)
+		}
+		recoverStartTimestampEpochNanoSeconds = float64(recoverStartTime.UnixNano())
 	}
-	recoverStartTimestampEpochNanoSeconds := float64(recoverStartTime.UnixNano())
-
-	conn, err := makeSQLClient(RecoverFromCDCAppName, useSystemDb)
-	if err != nil {
-		return err
-	}
-	defer func() { resErr = errors.CombineErrors(resErr, conn.Close()) }()
 
 	ctx := context.Background()
-
-	isValid, err := validateDBName(ctx, conn, recoverfromcdcCtx.RecoverCockroachDBName)
-	if err != nil {
-		return errors.Wrapf(err, "Error validating RecoverCockroachDBName: %v", recoverfromcdcCtx.RecoverCockroachDBName)
-	}
-	if !isValid {
-		return errors.Errorf("RecoverCockroachDBName: %v does not exist.", recoverfromcdcCtx.RecoverCockroachDBName)
-	}
-
-	isValid, err = validateTableName(ctx, conn, recoverfromcdcCtx.RecoverCockroachDBName, recoverfromcdcCtx.RecoverCockroachTableName)
-	if err != nil {
-		return errors.Wrapf(err, "Error validating RecoverCockroachTableName: %v", recoverfromcdcCtx.RecoverCockroachTableName)
-	}
-	if !isValid {
-		return errors.Errorf("RecoverCockroachTableName: %v does not exist.", recoverfromcdcCtx.RecoverCockroachTableName)
-	}
-
-	// Get the PK columns of the table. This is used for Delete.
-	// Currently, it assumes the PK is not changed during the recovery.
-	// TODO: support PK column(s) change, e.g. detect the Kafka Message `Key` combination is changed. replay Kafka message in 2 phases, one with an ending offset for the old PK,  and then starting new offset when the PK is modified.
-	pkColumns, err := getTablePKColumns(ctx, conn, recoverfromcdcCtx.RecoverCockroachDBName, recoverfromcdcCtx.RecoverCockroachTableName)
-	if err != nil {
-		return errors.Wrapf(err, "Error getting Primary Key columns for RecoverCockroachTableName: %v", recoverfromcdcCtx.RecoverCockroachTableName)
-	}
-	fmt.Printf("pkColumns: %v\n", pkColumns)
 
 	saramaConfig, kafkaBootstrapServers, kafkaTopicName, err := NewSaramaConfig(recoverfromcdcCtx.RecoverKafkaCommandConfigFile, recoverfromcdcCtx.RecoverKafkaBootstrapServer, recoverfromcdcCtx.RecoverKafkaTopicName, KafkaClientTypeConsumer)
 	if err != nil {
@@ -208,6 +174,46 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 			return errors.Wrapf(err, "Error from NewSaramaConfig for producer: %v", recoverfromcdcCtx.RecoverKafkaFanOutTargetCommandConfigFile)
 		}
 	} else {
+		// Validate the CLI parameters
+		if len(recoverfromcdcCtx.RecoverCockroachDBName) == 0 {
+			return errors.Errorf("RecoverCockroachDBName: %v is empty", recoverfromcdcCtx.RecoverCockroachDBName)
+		}
+
+		if len(recoverfromcdcCtx.RecoverCockroachTableName) == 0 {
+			return errors.Errorf("RecoverCockroachTableName: %v is empty", recoverfromcdcCtx.RecoverCockroachTableName)
+		}
+
+		conn, err = makeSQLClient(RecoverFromCDCAppName, useSystemDb)
+		if err != nil {
+			return err
+		}
+		defer func() { resErr = errors.CombineErrors(resErr, conn.Close()) }()
+
+		isValid, err := validateDBName(ctx, conn, recoverfromcdcCtx.RecoverCockroachDBName)
+		if err != nil {
+			return errors.Wrapf(err, "Error validating RecoverCockroachDBName: %v", recoverfromcdcCtx.RecoverCockroachDBName)
+		}
+		if !isValid {
+			return errors.Errorf("RecoverCockroachDBName: %v does not exist.", recoverfromcdcCtx.RecoverCockroachDBName)
+		}
+
+		isValid, err = validateTableName(ctx, conn, recoverfromcdcCtx.RecoverCockroachDBName, recoverfromcdcCtx.RecoverCockroachTableName)
+		if err != nil {
+			return errors.Wrapf(err, "Error validating RecoverCockroachTableName: %v", recoverfromcdcCtx.RecoverCockroachTableName)
+		}
+		if !isValid {
+			return errors.Errorf("RecoverCockroachTableName: %v does not exist.", recoverfromcdcCtx.RecoverCockroachTableName)
+		}
+
+		// Get the PK columns of the table. This is used for Delete.
+		// Currently, it assumes the PK is not changed during the recovery.
+		// TODO: support PK column(s) change, e.g. detect the Kafka Message `Key` combination is changed. replay Kafka message in 2 phases, one with an ending offset for the old PK,  and then starting new offset when the PK is modified.
+		pkColumns, err = getTablePKColumns(ctx, conn, recoverfromcdcCtx.RecoverCockroachDBName, recoverfromcdcCtx.RecoverCockroachTableName)
+		if err != nil {
+			return errors.Wrapf(err, "Error getting Primary Key columns for RecoverCockroachTableName: %v", recoverfromcdcCtx.RecoverCockroachTableName)
+		}
+		fmt.Printf("pkColumns: %v\n", pkColumns)
+
 		// For the replay mode, make the connection pool to the cockroachdb
 		dbConnPools, err = GetDBConnectionPool(ctx, conn, topicPartitions, recoverfromcdcCtx.RecoverUseBalanceDBConnection, recoverfromcdcCtx.RecoverUseBalanceDBConnectionLocalityFilter)
 		if err != nil {
@@ -1095,7 +1101,7 @@ func NewSaramaConfig(kafkaConsumerProducerConfigFile string, kafkaBootstrapServe
 		saramaConfig.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.BalanceStrategySticky}
 		saramaConfig.Consumer.Return.Errors = false
 		// increase when seeing "abandoned subscription to...because consuming was taking too long" or check slow writing to destination
-		saramaConfig.Consumer.MaxProcessingTime = 1000 * time.Millisecond
+		saramaConfig.Consumer.MaxProcessingTime = 5000 * time.Millisecond
 	}
 
 	if clientType == KafkaClientTypeProducer {
