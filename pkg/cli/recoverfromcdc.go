@@ -48,7 +48,7 @@ var recoverfromcdcCmd = &cobra.Command{
 
 const (
 	// BatchTimeout is the number of milliseconds to force to send the batch. in case of a slow consumer, which could take a long time to reach the batch size
-	BatchTimeout = 2000 * time.Millisecond
+	BatchTimeout = 5000 * time.Millisecond
 	// ReportIntervalSeconds is the number of seconds to report the progress of the recovery  for each partition.
 	ReportIntervalSeconds = 10
 	// KafkaConsumerMaxMessageBytes is the message bytes for the consumer to fetch
@@ -72,7 +72,9 @@ const (
 	// CDCMessageTypeUnknown is the unknown message type
 	CDCMessageTypeUnknown = "unknown"
 	// KafkaStartOffsetDefault is the default value when it's not specified in the CLI
-	KafkaStartOffsetDefault = 0
+	KafkaStartOffsetDefault = 0.0
+	// KafkaEndOffsetDefault is the default value when it's not specified in the CLI
+	KafkaEndOffsetDefault = -1.0
 	// EmptyString is the empty string ""
 	EmptyString = ""
 	// RecoverBatchSizeDefault is the number of message to consume, de-dup, and upsert/delete.
@@ -132,7 +134,7 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 	//	return errors.Errorf("RecoverKafkaTopicName: %v is empty", recoverfromcdcCtx.RecoverKafkaTopicName)
 	//}
 
-	recoverStartTimestampEpochNanoSeconds := 0.0
+	recoverStartTimestampEpochNanoSeconds := KafkaStartOffsetDefault
 	if len(recoverfromcdcCtx.RecoverStartTimestamp) > 0 {
 		// convert the UTC timestamp to Unix epoch nanoseconds as float64
 		recoverStartTime, err := time.Parse(time.RFC3339Nano, recoverfromcdcCtx.RecoverStartTimestamp)
@@ -140,6 +142,16 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 			return errors.Wrapf(err, "invalid recoverfromcdcCtx.RecoverStartTimestamp: %v", recoverfromcdcCtx.RecoverStartTimestamp)
 		}
 		recoverStartTimestampEpochNanoSeconds = float64(recoverStartTime.UnixNano())
+	}
+
+	recoverEndTimestampEpochNanoSeconds := KafkaEndOffsetDefault
+	if len(recoverfromcdcCtx.RecoverEndTimestamp) > 0 {
+		// convert the UTC timestamp to Unix epoch nanoseconds as float64
+		recoverEndTime, err := time.Parse(time.RFC3339Nano, recoverfromcdcCtx.RecoverEndTimestamp)
+		if err != nil {
+			return errors.Wrapf(err, "invalid recoverfromcdcCtx.RecoverEndTimestamp: %v", recoverfromcdcCtx.RecoverEndTimestamp)
+		}
+		recoverEndTimestampEpochNanoSeconds = float64(recoverEndTime.UnixNano())
 	}
 
 	ctx := context.Background()
@@ -261,7 +273,7 @@ func runRecoverFromCDC(cmd *cobra.Command, args []string) (resErr error) {
 
 		//go func(pcCtx context.Context, pc sarama.PartitionConsumer, partition int32, batchSize int, conn clisqlclient.Conn, closing chan struct{}) {
 		pcGroup.Go(func() error {
-			err := fetchPartitionConsumer(pcCtx, pc, partition, recoverfromcdcCtx.RecoverBatchSize, dbConnPools[partition], closing, recoverStartTimestampEpochNanoSeconds, pkColumns, saramaProducerConfig, kafkaProducerBootstrapServers, kafkaProducerTopicName, recoverfromcdcCtx.RecoverKafkaFanOutEnable)
+			err := fetchPartitionConsumer(pcCtx, pc, partition, recoverfromcdcCtx.RecoverBatchSize, dbConnPools[partition], closing, recoverStartTimestampEpochNanoSeconds, recoverEndTimestampEpochNanoSeconds, pkColumns, saramaProducerConfig, kafkaProducerBootstrapServers, kafkaProducerTopicName, recoverfromcdcCtx.RecoverKafkaFanOutEnable)
 			return err
 		})
 	}
@@ -381,7 +393,7 @@ func getPartitions(c sarama.Consumer) ([]int32, error) {
 }
 
 // fetchPartitionConsumer fetches messages from by partition, by batch and de-dup by the message key
-func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, partition int32, batchSize int, conns map[string]*pgxpool.Pool, closing chan struct{}, recoverStartTimestampEpochNanoSeconds float64, pkColumns []string, saramaProducerConfig *sarama.Config, kafkaProducerBootstrapServers, kafkaProducerTopicName string, enableFanOut bool) error {
+func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, partition int32, batchSize int, conns map[string]*pgxpool.Pool, closing chan struct{}, recoverStartTimestampEpochNanoSeconds float64, recoverEndTimestampEpochNanoSeconds float64, pkColumns []string, saramaProducerConfig *sarama.Config, kafkaProducerBootstrapServers, kafkaProducerTopicName string, enableFanOut bool) error {
 	var kafkaProducerClient sarama.SyncProducer
 	var err error
 	var currentOffset, rowsUpserted, rowsDeleted, previousRowsUpserted, previousRowsDeleted, queriesUpserted, queriesDeleted, previousQueriesUpserted, previousQueriesDeleted int64
@@ -469,7 +481,7 @@ func fetchPartitionConsumer(pcCtx context.Context, pc sarama.PartitionConsumer, 
 
 			// Since within the batchSize window, there could be duplicated Message Key,
 			// instead of using the condition (count % batchSize !=0),  use (len(msgBatch) < batchSize)
-			if (len(msgBatch) < batchSize) && !filterCDCMessage(msgType, recoverfromcdcCtx.RecoverKafkaStartOffset, recoverStartTimestampEpochNanoSeconds, currentOffset, updatedTimestamp) {
+			if (len(msgBatch) < batchSize) && !filterCDCMessage(msgType, recoverfromcdcCtx.RecoverKafkaStartOffset, recoverfromcdcCtx.RecoverKafkaEndOffset, recoverStartTimestampEpochNanoSeconds, recoverEndTimestampEpochNanoSeconds, currentOffset, updatedTimestamp) {
 				//fmt.Printf("rowImage: %v, updatedTimestamp: %f\n", rowImage, updatedTimestamp)
 				// This only for duplicateCount metric, the extra lookup should not incur too much performance penality
 				if _, ok := msgBatch[string(message.Key)]; ok {
@@ -655,7 +667,7 @@ func parseCDCMessageUpdatedTimestamp(jsonMap map[string]interface{}) (float64, e
 }
 
 // filterCDCMessage returns true if the CDCMessage should be filtered(ignored/skipped)
-func filterCDCMessage(msgType string, recoverStartOffset int64, recoverStartTimestampEpochNanoSeconds float64, currentOffset int64, updatedTimestamp float64) bool {
+func filterCDCMessage(msgType string, recoverStartOffset int64, recoverEndOffset int64, recoverStartTimestampEpochNanoSeconds float64, recoverEndTimestampEpochNanoSeconds float64, currentOffset int64, updatedTimestamp float64) bool {
 	// Only Upsert/Delete CDCMessage should be processed. The others should be skipped
 	if (msgType != CDCMessageTypeUpsert) && (msgType != CDCMessageTypeDelete) {
 		return true
@@ -667,8 +679,18 @@ func filterCDCMessage(msgType string, recoverStartOffset int64, recoverStartTime
 		return currentOffset < recoverStartOffset
 	}
 
+	// if recoverEndOffset is specified,  then filter the offset greater than it,  only when the Start Offset is also specified.
+	if recoverStartOffset > KafkaStartOffsetDefault && recoverEndOffset > KafkaEndOffsetDefault {
+		return currentOffset >= recoverEndOffset
+	}
+
 	// use recoverStartTimestampEpochNanoSeconds to filter updatedTimestamp
 	if recoverStartTimestampEpochNanoSeconds <= updatedTimestamp {
+		return false
+	}
+
+	// if recoverEndTimestampEpochNanoSeconds is specified (default is -1), return false if it's > updatedTimestamp
+	if recoverEndTimestampEpochNanoSeconds > 0.0 && recoverEndTimestampEpochNanoSeconds > updatedTimestamp {
 		return false
 	}
 
@@ -1101,7 +1123,7 @@ func NewSaramaConfig(kafkaConsumerProducerConfigFile string, kafkaBootstrapServe
 		saramaConfig.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.BalanceStrategySticky}
 		saramaConfig.Consumer.Return.Errors = false
 		// increase when seeing "abandoned subscription to...because consuming was taking too long" or check slow writing to destination
-		saramaConfig.Consumer.MaxProcessingTime = 5000 * time.Millisecond
+		saramaConfig.Consumer.MaxProcessingTime = 30000 * time.Millisecond
 	}
 
 	if clientType == KafkaClientTypeProducer {
