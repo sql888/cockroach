@@ -115,6 +115,8 @@ const (
 	KafkaClientTypeConsumer = `Consumer`
 	// KafkaClientTypeProducer is the kafka client type Producer
 	KafkaClientTypeProducer = `Producer`
+	// DBDuplicateViolatonErrorMessage is the error message for the unique constraint violation
+	DBDuplicateViolatonErrorMessage = `duplicate key value violates unique constraint`
 )
 
 // runRecoverFromCDC implements to logic to recover the db.table using CDC, only Kafka sink is supported as of now.
@@ -865,17 +867,18 @@ func convertInterfaceToMap(rowImage interface{}) (map[string]interface{}, error)
 
 // dbExecuteUpsertDelete executes the upsert/delete (and other) SQL statements
 func dbExecuteUpsertDelete(ctx context.Context, conn *pgxpool.Pool, sqlStmt string, queryParams []interface{}) error {
-	//func dbExecuteUpsertDelete(ctx context.Context, conn *pgxpool.Pool, sqlStmt string, queryParams []interface{}) error {
 	var dbErr error
-	//queryParamsAny := make([]any, len(queryParams))
-	//for i, queryParamAny := range queryParams {
-	//	queryParamsAny[i] = queryParamAny
-	//}
-	for i := 0; i <= DBErrorRetriesDefault; i++ {
+	noDBDuplicateViolation := true
+	// if it's unique constraint violation, keep retrying. Eventually it should resolve.
+	// TODO (gli): the caller can reduce the batch size to 1 if unique constraint violation is found.
+	for i := 0; i <= DBErrorRetriesDefault && noDBDuplicateViolation; i++ {
 		// ignore the pgconn.CommandTag{} for now
 		_, dbErr = conn.Exec(ctx, sqlStmt, queryParams...)
 		if dbErr == nil {
 			return nil
+		}
+		if strings.Contains(dbErr.Error(), DBDuplicateViolatonErrorMessage) {
+			noDBDuplicateViolation = false
 		}
 		fmt.Printf("dbExecuteUpsertDelete() error executing query: %v, queryParams: %v, retry#: %d, dbErr: %v\n", sqlStmt, queryParams, i+1, dbErr)
 		time.Sleep(100 * time.Millisecond)
