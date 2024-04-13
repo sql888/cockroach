@@ -833,12 +833,13 @@ func doDelete(ctx context.Context, conn *pgxpool.Pool, dbName string, tableName 
 					fmt.Printf("doDelete() pk column name: %v not found in rowImageMap: %v\n", pkColumnName, rowImage)
 					return errors.Errorf("doDelete() pk column name: %v not found in rowImageMap: %v", pkColumnName, rowImage)
 				}
-				pkColumnValueString, ok := pkColumnValue.(string)
-				if !ok {
-					fmt.Printf("dbUpsert(): error converting columnValue: %v to string\n", pkColumnValue)
-					return errors.Errorf("dbUpsert(): error converting columnValue: %v to string", pkColumnValue)
-				}
-				queryParams = append(queryParams, pkColumnValueString)
+				//pkColumnValueString, ok := pkColumnValue.(string)
+				//if !ok {
+				//	fmt.Printf("dbDelete(): error converting columnValue: %v to string\n", pkColumnValue)
+				//	return errors.Errorf("dbDelete(): error converting columnValue: %v to string", pkColumnValue)
+				//}
+				//queryParams = append(queryParams, pkColumnValueString)
+				queryParams = append(queryParams, pkColumnValue)
 			}
 		}
 		// fmt.Printf("doDelete() DEBUG, sqlStmt: %s, queryParams: %v\n", sqlStmt, queryParams)
